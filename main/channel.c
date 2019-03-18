@@ -116,12 +116,6 @@ struct chanlist {
 /*! \brief the list of registered channel types */
 static AST_RWLIST_HEAD_STATIC(backends, chanlist);
 
-#ifdef LOW_MEMORY
-#define NUM_CHANNEL_BUCKETS 61
-#else
-#define NUM_CHANNEL_BUCKETS 1567
-#endif
-
 /*! \brief All active channels on the system */
 static struct ao2_container *channels;
 
@@ -635,38 +629,6 @@ int ast_str2cause(const char *name)
 	return -1;
 }
 
-static struct stasis_message *create_channel_snapshot_message(struct ast_channel *channel)
-{
-	RAII_VAR(struct ast_channel_snapshot *, snapshot, NULL, ao2_cleanup);
-
-	if (!ast_channel_snapshot_type()) {
-		return NULL;
-	}
-
-	ast_channel_lock(channel);
-	snapshot = ast_channel_snapshot_create(channel);
-	ast_channel_unlock(channel);
-	if (!snapshot) {
-		return NULL;
-	}
-
-	return stasis_message_create(ast_channel_snapshot_type(), snapshot);
-}
-
-static void publish_cache_clear(struct ast_channel *chan)
-{
-	RAII_VAR(struct stasis_message *, message, NULL, ao2_cleanup);
-	RAII_VAR(struct stasis_message *, clear_msg, NULL, ao2_cleanup);
-
-	clear_msg = create_channel_snapshot_message(chan);
-	if (!clear_msg) {
-		return;
-	}
-
-	message = stasis_cache_clear_create(clear_msg);
-	stasis_publish(ast_channel_topic(chan), message);
-}
-
 /*! \brief Gives the string form of a given channel state.
  *
  * \note This function is not reentrant.
@@ -751,7 +713,7 @@ static int ast_channel_by_uniqueid_cb(void *obj, void *arg, void *data, int flag
 static int does_id_conflict(const char *uniqueid)
 {
 	struct ast_channel *conflict;
-	int length = 0;
+	size_t length = 0;
 
 	if (ast_strlen_zero(uniqueid)) {
 		return 0;
@@ -1236,7 +1198,9 @@ int ast_queue_hold(struct ast_channel *chan, const char *musicclass)
 				     "musicclass", musicclass);
 	}
 
-	ast_channel_publish_cached_blob(chan, ast_channel_hold_type(), blob);
+	ast_channel_lock(chan);
+	ast_channel_publish_blob(chan, ast_channel_hold_type(), blob);
+	ast_channel_unlock(chan);
 
 	res = ast_queue_frame(chan, &f);
 
@@ -1250,7 +1214,9 @@ int ast_queue_unhold(struct ast_channel *chan)
 	struct ast_frame f = { AST_FRAME_CONTROL, .subclass.integer = AST_CONTROL_UNHOLD };
 	int res;
 
-	ast_channel_publish_cached_blob(chan, ast_channel_unhold_type(), NULL);
+	ast_channel_lock(chan);
+	ast_channel_publish_blob(chan, ast_channel_unhold_type(), NULL);
+	ast_channel_unlock(chan);
 
 	res = ast_queue_frame(chan, &f);
 
@@ -2230,9 +2196,8 @@ static void ast_channel_destructor(void *obj)
 		ast_assert(!ast_test_flag(ast_channel_flags(chan), AST_FLAG_SNAPSHOT_STAGE));
 
 		ast_channel_lock(chan);
-		ast_channel_publish_snapshot(chan);
+		ast_channel_publish_final_snapshot(chan);
 		ast_channel_unlock(chan);
-		publish_cache_clear(chan);
 	}
 
 	ast_channel_lock(chan);
@@ -2618,10 +2583,10 @@ void ast_hangup(struct ast_channel *chan)
 	ast_channel_generator_set(chan, NULL);
 
 	if (ast_test_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING)) {
-		ast_log(LOG_WARNING, "Hard hangup called by thread %ld on %s, while fd "
-			"is blocked by thread %ld in procedure %s!  Expect a failure\n",
-			(long) pthread_self(), ast_channel_name(chan), (long)ast_channel_blocker(chan), ast_channel_blockproc(chan));
-		ast_assert(ast_test_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING) == 0);
+		ast_log(LOG_WARNING, "Hard hangup called by thread LWP %d on %s, while blocked by thread LWP %d in procedure %s!  Expect a failure\n",
+			ast_get_tid(), ast_channel_name(chan), ast_channel_blocker_tid(chan),
+			ast_channel_blockproc(chan));
+		ast_assert(0);
 	}
 
 	if (ast_channel_tech(chan)->hangup) {
@@ -3344,7 +3309,7 @@ static void send_dtmf_begin_event(struct ast_channel *chan,
 		return;
 	}
 
-	ast_channel_publish_cached_blob(chan, ast_channel_dtmf_begin_type(), blob);
+	ast_channel_publish_blob(chan, ast_channel_dtmf_begin_type(), blob);
 }
 
 static void send_dtmf_end_event(struct ast_channel *chan,
@@ -3361,7 +3326,7 @@ static void send_dtmf_end_event(struct ast_channel *chan,
 		return;
 	}
 
-	ast_channel_publish_cached_blob(chan, ast_channel_dtmf_end_type(), blob);
+	ast_channel_publish_blob(chan, ast_channel_dtmf_end_type(), blob);
 }
 
 static void ast_read_generator_actions(struct ast_channel *chan, struct ast_frame *f)
@@ -3661,7 +3626,6 @@ static struct ast_frame *__ast_read(struct ast_channel *chan, int dropaudio, int
 			}
 		}
 	} else {
-		ast_channel_blocker_set(chan, pthread_self());
 		if (ast_test_flag(ast_channel_flags(chan), AST_FLAG_EXCEPTION)) {
 			if (ast_channel_tech(chan)->exception)
 				f = ast_channel_tech(chan)->exception(chan);
@@ -3772,6 +3736,11 @@ static struct ast_frame *__ast_read(struct ast_channel *chan, int dropaudio, int
 							read_action_payload->payload_size);
 					}
 					ast_party_connected_line_free(&connected);
+					ast_channel_lock(chan);
+					break;
+				case AST_FRAME_READ_ACTION_SEND_TEXT:
+					ast_channel_unlock(chan);
+					ast_sendtext(chan, (const char *) read_action_payload->payload);
 					ast_channel_lock(chan);
 					break;
 				}
@@ -4674,7 +4643,8 @@ int ast_sendtext_data(struct ast_channel *chan, struct ast_msg_data *msg)
 		&& (ast_strlen_zero(content_type) || ast_begins_with(content_type, "text/"))
 		&& (ast_format_cap_has_type(ast_channel_nativeformats(chan), AST_MEDIA_TYPE_TEXT))) {
 		struct ast_frame f;
-		size_t body_len = strlen(body) + 1;
+		/* T.140 payload does not include the null byte terminator */
+		size_t body_len = strlen(body);
 
 		/* Process as T.140 text (moved here from ast_sendtext() */
 		memset(&f, 0, sizeof(f));
@@ -4704,8 +4674,8 @@ int ast_sendtext_data(struct ast_channel *chan, struct ast_msg_data *msg)
 		ast_debug(1, "Sending TEXT to %s: %s\n", ast_channel_name(chan), body);
 		res = ast_channel_tech(chan)->send_text(chan, body);
 	} else {
-		ast_debug(1, "Channel technology does not support sending text on channel '%s'\n",
-			ast_channel_name(chan));
+		ast_debug(1, "Channel technology does not support sending content type '%s' on channel '%s'\n",
+			S_OR(content_type, "text/plain"), ast_channel_name(chan));
 		res = -1;
 	}
 	ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING);
@@ -4810,12 +4780,28 @@ int ast_senddigit_end(struct ast_channel *chan, char digit, unsigned int duratio
 
 int ast_senddigit(struct ast_channel *chan, char digit, unsigned int duration)
 {
+	if (duration < AST_DEFAULT_EMULATE_DTMF_DURATION) {
+		duration = AST_DEFAULT_EMULATE_DTMF_DURATION;
+	}
 	if (ast_channel_tech(chan)->send_digit_begin) {
 		ast_senddigit_begin(chan, digit);
-		ast_safe_sleep(chan, (duration >= AST_DEFAULT_EMULATE_DTMF_DURATION ? duration : AST_DEFAULT_EMULATE_DTMF_DURATION));
+		ast_safe_sleep(chan, duration);
 	}
 
-	return ast_senddigit_end(chan, digit, (duration >= AST_DEFAULT_EMULATE_DTMF_DURATION ? duration : AST_DEFAULT_EMULATE_DTMF_DURATION));
+	return ast_senddigit_end(chan, digit, duration);
+}
+
+int ast_senddigit_external(struct ast_channel *chan, char digit, unsigned int duration)
+{
+	if (duration < AST_DEFAULT_EMULATE_DTMF_DURATION) {
+		duration = AST_DEFAULT_EMULATE_DTMF_DURATION;
+	}
+	if (ast_channel_tech(chan)->send_digit_begin) {
+		ast_senddigit_begin(chan, digit);
+		usleep(duration * 1000);
+	}
+
+	return ast_senddigit_end(chan, digit, duration);
 }
 
 int ast_prod(struct ast_channel *chan)
@@ -5009,7 +4995,7 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 		goto done;
 	}
 
-	if (ast_channel_generatordata(chan) && (!fr->src || strcasecmp(fr->src, "ast_prod"))) {
+	if (ast_channel_generatordata(chan) && (fr->frametype != AST_FRAME_RTCP) && (!fr->src || strcasecmp(fr->src, "ast_prod"))) {
 		if (ast_test_flag(ast_channel_flags(chan), AST_FLAG_WRITE_INT)) {
 				ast_deactivate_generator(chan);
 		} else {
@@ -5017,11 +5003,9 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 				/* There is a generator running while we're in the middle of a digit.
 				 * It's probably inband DTMF, so go ahead and pass it so it can
 				 * stop the generator */
-				ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING);
 				ast_channel_unlock(chan);
 				res = ast_senddigit_end(chan, fr->subclass.integer, fr->len);
 				ast_channel_lock(chan);
-				CHECK_BLOCKING(chan);
 			} else if (fr->frametype == AST_FRAME_CONTROL
 				&& fr->subclass.integer == AST_CONTROL_UNHOLD) {
 				/*
@@ -5039,7 +5023,6 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 	/* High bit prints debugging */
 	if (ast_channel_fout(chan) & DEBUGCHAN_FLAG)
 		ast_frame_dump(ast_channel_name(chan), fr, ">>");
-	CHECK_BLOCKING(chan);
 	switch (fr->frametype) {
 	case AST_FRAME_CONTROL:
 		indicate_data_internal(chan, fr->subclass.integer, fr->data.ptr, fr->datalen);
@@ -5053,11 +5036,9 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 				f = fr;
 		}
 		send_dtmf_begin_event(chan, DTMF_SENT, fr->subclass.integer);
-		ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING);
 		ast_channel_unlock(chan);
 		res = ast_senddigit_begin(chan, fr->subclass.integer);
 		ast_channel_lock(chan);
-		CHECK_BLOCKING(chan);
 		break;
 	case AST_FRAME_DTMF_END:
 		if (ast_channel_audiohooks(chan)) {
@@ -5069,13 +5050,12 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 			}
 		}
 		send_dtmf_end_event(chan, DTMF_SENT, fr->subclass.integer, fr->len);
-		ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING);
 		ast_channel_unlock(chan);
 		res = ast_senddigit_end(chan, fr->subclass.integer, fr->len);
 		ast_channel_lock(chan);
-		CHECK_BLOCKING(chan);
 		break;
 	case AST_FRAME_TEXT:
+		CHECK_BLOCKING(chan);
 		if (ast_format_cmp(fr->subclass.format, ast_format_t140) == AST_FORMAT_CMP_EQUAL) {
 			res = (ast_channel_tech(chan)->write_text == NULL) ? 0 :
 				ast_channel_tech(chan)->write_text(chan, fr);
@@ -5083,13 +5063,17 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 			res = (ast_channel_tech(chan)->send_text == NULL) ? 0 :
 				ast_channel_tech(chan)->send_text(chan, (char *) fr->data.ptr);
 		}
+		ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING);
 		break;
 	case AST_FRAME_HTML:
+		CHECK_BLOCKING(chan);
 		res = (ast_channel_tech(chan)->send_html == NULL) ? 0 :
 			ast_channel_tech(chan)->send_html(chan, fr->subclass.integer, (char *) fr->data.ptr, fr->datalen);
+		ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING);
 		break;
 	case AST_FRAME_VIDEO:
 		/* XXX Handle translation of video codecs one day XXX */
+		CHECK_BLOCKING(chan);
 		if (ast_channel_tech(chan)->write_stream) {
 			if (stream) {
 				res = ast_channel_tech(chan)->write_stream(chan, ast_stream_get_position(stream), fr);
@@ -5101,8 +5085,10 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 		} else {
 			res = 0;
 		}
+		ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING);
 		break;
 	case AST_FRAME_MODEM:
+		CHECK_BLOCKING(chan);
 		if (ast_channel_tech(chan)->write_stream) {
 			if (stream) {
 				res = ast_channel_tech(chan)->write_stream(chan, ast_stream_get_position(stream), fr);
@@ -5114,6 +5100,7 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 		} else {
 			res = 0;
 		}
+		ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING);
 		break;
 	case AST_FRAME_VOICE:
 		if (ast_opt_generic_plc && ast_format_cmp(fr->subclass.format, ast_format_slin) == AST_FORMAT_CMP_EQUAL) {
@@ -5163,15 +5150,15 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 
 			if (ast_channel_writetrans(chan)) {
 				struct ast_frame *trans_frame = ast_translate(ast_channel_writetrans(chan), f, 0);
-                               if (trans_frame != f && f != fr) {
-                                       /*
-                                        * If translate gives us a new frame and so did the audio
-                                        * hook then we need to free the one from the audio hook.
-                                        */
-                                       ast_frfree(f);
-                               }
-                               f = trans_frame;
-                       }
+				if (trans_frame != f && f != fr) {
+					/*
+					 * If translate gives us a new frame and so did the audio
+					 * hook then we need to free the one from the audio hook.
+					 */
+					ast_frfree(f);
+				}
+				f = trans_frame;
+			}
 		}
 
 		if (!f) {
@@ -5238,7 +5225,7 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 				if (jump >= 0) {
 					jump = calc_monitor_jump((ast_channel_insmpl(chan) - ast_channel_outsmpl(chan)),
 					                         ast_format_get_sample_rate(f->subclass.format),
-					                         ast_format_get_sample_rate(ast_channel_monitor(chan)->read_stream->fmt->format));
+					                         ast_format_get_sample_rate(ast_channel_monitor(chan)->write_stream->fmt->format));
 					if (ast_seekstream(ast_channel_monitor(chan)->write_stream, jump, SEEK_FORCECUR) == -1) {
 						ast_log(LOG_WARNING, "Failed to perform seek in monitoring write stream, synchronization between the files may be broken\n");
 					}
@@ -5249,7 +5236,7 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 #else
 				int jump = calc_monitor_jump((ast_channel_insmpl(chan) - ast_channel_outsmpl(chan)),
 				                             ast_format_get_sample_rate(f->subclass.format),
-				                             ast_format_get_sample_rate(ast_channel_monitor(chan)->read_stream->fmt->format));
+				                             ast_format_get_sample_rate(ast_channel_monitor(chan)->write_stream->fmt->format));
 				if (jump - MONITOR_DELAY >= 0) {
 					if (ast_seekstream(ast_channel_monitor(chan)->write_stream, jump - cur->samples, SEEK_FORCECUR) == -1) {
 						ast_log(LOG_WARNING, "Failed to perform seek in monitoring write stream, synchronization between the files may be broken\n");
@@ -5269,6 +5256,7 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 		/* the translator on chan->writetrans may have returned multiple frames
 		   from the single frame we passed in; if so, feed each one of them to the
 		   channel, freeing each one after it has been written */
+		CHECK_BLOCKING(chan);
 		if ((f != fr) && AST_LIST_NEXT(f, frame_list)) {
 			struct ast_frame *cur, *next = NULL;
 			unsigned int skip = 0;
@@ -5307,6 +5295,7 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 				res = 0;
 			}
 		}
+		ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING);
 		break;
 	case AST_FRAME_NULL:
 	case AST_FRAME_IAX:
@@ -5315,23 +5304,26 @@ int ast_write_stream(struct ast_channel *chan, int stream_num, struct ast_frame 
 		break;
 	case AST_FRAME_RTCP:
 		/* RTCP information is on a per-stream basis and only available on multistream capable channels */
+		CHECK_BLOCKING(chan);
 		if (ast_channel_tech(chan)->write_stream && stream) {
 			res = ast_channel_tech(chan)->write_stream(chan, ast_stream_get_position(stream), fr);
 		} else {
 			res = 0;
 		}
+		ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING);
 		break;
 	default:
 		/* At this point, fr is the incoming frame and f is NULL.  Channels do
 		 * not expect to get NULL as a frame pointer and will segfault.  Hence,
 		 * we output the original frame passed in. */
+		CHECK_BLOCKING(chan);
 		res = ast_channel_tech(chan)->write(chan, fr);
+		ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING);
 		break;
 	}
 
 	if (f && f != fr)
 		ast_frfree(f);
-	ast_clear_flag(ast_channel_flags(chan), AST_FLAG_BLOCKING);
 
 	/* Consider a write failure to force a soft hangup */
 	if (res < 0) {
@@ -5900,7 +5892,9 @@ struct ast_channel *__ast_request_and_dial(const char *type, struct ast_format_c
 	 */
 	ast_set_callerid(chan, cid_num, cid_name, cid_num);
 
+	ast_channel_lock(chan);
 	ast_set_flag(ast_channel_flags(chan), AST_FLAG_ORIGINATED);
+	ast_channel_unlock(chan);
 	ast_party_connected_line_set_init(&connected, ast_channel_connected(chan));
 	if (cid_num) {
 		connected.id.number.valid = 1;
@@ -6767,6 +6761,12 @@ static void channel_do_masquerade(struct ast_channel *original, struct ast_chann
 		ast_channel_name(clonechan), ast_channel_state(clonechan),
 		ast_channel_name(original), ast_channel_state(original));
 
+	/* When all is said and done force new snapshot segments so they are
+	 * up to date.
+	 */
+	ast_set_flag(ast_channel_snapshot_segment_flags(original), AST_FLAGS_ALL);
+	ast_set_flag(ast_channel_snapshot_segment_flags(clonechan), AST_FLAGS_ALL);
+
 	/*
 	 * Remember the original read/write formats.  We turn off any
 	 * translation on either one
@@ -6789,6 +6789,14 @@ static void channel_do_masquerade(struct ast_channel *original, struct ast_chann
 
 	/* Make sure the Stasis topic on the channel is updated appropriately */
 	ast_channel_internal_swap_topics(clonechan, original);
+
+	/* Swap endpoint forward so channel created with endpoint exchanges its state
+	 * with other channel for proper endpoint cleanup.
+	 */
+	ast_channel_internal_swap_endpoint_forward(clonechan, original);
+
+	/* The old snapshots need to follow the channels so the snapshot update is correct */
+	ast_channel_internal_swap_snapshots(clonechan, original);
 
 	/* Swap channel names. This uses ast_channel_name_set directly, so we
 	 * don't get any spurious rename events.
@@ -7186,6 +7194,7 @@ void ast_channel_set_caller(struct ast_channel *chan, const struct ast_party_cal
 
 	ast_channel_lock(chan);
 	ast_party_caller_set(ast_channel_caller(chan), caller, update);
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_CALLER);
 	ast_channel_unlock(chan);
 }
 
@@ -7198,6 +7207,7 @@ void ast_channel_set_caller_event(struct ast_channel *chan, const struct ast_par
 
 	ast_channel_lock(chan);
 	ast_party_caller_set(ast_channel_caller(chan), caller, update);
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_CALLER);
 	ast_channel_publish_snapshot(chan);
 	ast_channel_unlock(chan);
 }
@@ -7217,7 +7227,7 @@ int ast_setstate(struct ast_channel *chan, enum ast_channel_state state)
 
 	ast_channel_state_set(chan, state);
 
-	ast_publish_channel_state(chan);
+	ast_channel_publish_snapshot(chan);
 
 	/* We have to pass AST_DEVICE_UNKNOWN here because it is entirely possible that the channel driver
 	 * for this channel is using the callback method for device state. If we pass in an actual state here
@@ -7507,8 +7517,8 @@ struct ast_namedgroups *ast_get_namedgroups(const char *s)
 		return NULL;
 	}
 
-	namedgroups = ao2_container_alloc_options(AO2_ALLOC_OPT_LOCK_NOLOCK, 19,
-		namedgroup_hash_cb, namedgroup_cmp_cb);
+	namedgroups = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_NOLOCK, 0, 19,
+		namedgroup_hash_cb, NULL, namedgroup_cmp_cb);
 	if (!namedgroups) {
 		return NULL;
 	}
@@ -7827,8 +7837,8 @@ static void channels_shutdown(void)
 
 int ast_channels_init(void)
 {
-	channels = ao2_container_alloc(NUM_CHANNEL_BUCKETS,
-			ast_channel_hash_cb, ast_channel_cmp_cb);
+	channels = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, AST_NUM_CHANNEL_BUCKETS,
+		ast_channel_hash_cb, NULL, ast_channel_cmp_cb);
 	if (!channels) {
 		return -1;
 	}
@@ -8123,6 +8133,7 @@ void ast_channel_set_connected_line(struct ast_channel *chan, const struct ast_p
 
 	ast_channel_lock(chan);
 	ast_party_connected_line_set(ast_channel_connected(chan), connected, update);
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_CONNECTED);
 	ast_channel_publish_snapshot(chan);
 	ast_channel_unlock(chan);
 }
@@ -8933,6 +8944,7 @@ void ast_channel_set_redirecting(struct ast_channel *chan, const struct ast_part
 
 	ast_channel_lock(chan);
 	ast_party_redirecting_set(ast_channel_redirecting(chan), redirecting, update);
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_CALLER);
 	ast_channel_unlock(chan);
 }
 

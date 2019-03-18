@@ -41,6 +41,9 @@
 #include "asterisk/stasis_bridges.h"
 #include "asterisk/stasis_endpoints.h"
 #include "asterisk/config_options.h"
+#ifdef AST_DEVMODE
+#include "asterisk/cli.h"
+#endif
 
 /*** DOCUMENTATION
 	<managerEvent language="en_US" name="UserEvent">
@@ -304,14 +307,72 @@ static struct ast_threadpool *pool;
 
 STASIS_MESSAGE_TYPE_DEFN(stasis_subscription_change_type);
 
+#ifdef AST_DEVMODE
+
+/*! The number of buckets to use for topic statistics */
+#define TOPIC_STATISTICS_BUCKETS 57
+
+/*! The number of buckets to use for subscription statistics */
+#define SUBSCRIPTION_STATISTICS_BUCKETS 57
+
+/*! Container which stores statistics for topics */
+static struct ao2_container *topic_statistics;
+
+/*! Container which stores statistics for subscriptions */
+static struct ao2_container *subscription_statistics;
+
+/*! \internal */
+struct stasis_message_type_statistics {
+	/*! \brief The number of messages of this published */
+	int published;
+	/*! \brief The number of messages of this that did not reach a subscriber */
+	int unused;
+	/*! \brief The stasis message type */
+	struct stasis_message_type *message_type;
+};
+
+/*! Lock to protect the message types vector */
+AST_MUTEX_DEFINE_STATIC(message_type_statistics_lock);
+
+/*! Vector containing message type information */
+static AST_VECTOR(, struct stasis_message_type_statistics) message_type_statistics;
+
+/*! \internal */
+struct stasis_topic_statistics {
+	/*! \brief Highest time spent dispatching messages to subscribers */
+	long highest_time_dispatched;
+	/*! \brief Lowest time spent dispatching messages to subscribers */
+	long lowest_time_dispatched;
+	/*! \brief The number of messages that were not dispatched to any subscriber */
+	int messages_not_dispatched;
+	/*! \brief The number of messages that were dispatched to at least 1 subscriber */
+	int messages_dispatched;
+	/*! \brief The ids of the subscribers to this topic */
+	struct ao2_container *subscribers;
+	/*! \brief Pointer to the topic (NOT refcounted, and must NOT be accessed) */
+	struct stasis_topic *topic;
+	/*! \brief Name of the topic */
+	char name[0];
+};
+#endif
+
 /*! \internal */
 struct stasis_topic {
-	char *name;
 	/*! Variable length array of the subscribers */
 	AST_VECTOR(, struct stasis_subscription *) subscribers;
 
 	/*! Topics forwarding into this topic */
 	AST_VECTOR(, struct stasis_topic *) upstream_topics;
+
+#ifdef AST_DEVMODE
+	struct stasis_topic_statistics *statistics;
+#endif
+
+	/*! Unique incrementing integer for subscriber ids */
+	int subscriber_id;
+
+	/*! Name of the topic */
+	char name[0];
 };
 
 /* Forward declarations for the tightly-coupled subscription object */
@@ -337,28 +398,73 @@ static void topic_dtor(void *obj)
 	 * unsubscribed before we get here. */
 	ast_assert(AST_VECTOR_SIZE(&topic->subscribers) == 0);
 
-	ast_free(topic->name);
-	topic->name = NULL;
-
 	AST_VECTOR_FREE(&topic->subscribers);
 	AST_VECTOR_FREE(&topic->upstream_topics);
+	ast_debug(1, "Topic '%s': %p destroyed\n", topic->name, topic);
+
+#ifdef AST_DEVMODE
+	if (topic->statistics) {
+		ao2_unlink(topic_statistics, topic->statistics);
+		ao2_ref(topic->statistics, -1);
+	}
+#endif
 }
+
+#ifdef AST_DEVMODE
+static void topic_statistics_destroy(void *obj)
+{
+	struct stasis_topic_statistics *statistics = obj;
+
+	ao2_cleanup(statistics->subscribers);
+}
+
+static struct stasis_topic_statistics *stasis_topic_statistics_create(struct stasis_topic *topic)
+{
+	struct stasis_topic_statistics *statistics;
+
+	statistics = ao2_alloc(sizeof(*statistics) + strlen(topic->name) + 1, topic_statistics_destroy);
+	if (!statistics) {
+		return NULL;
+	}
+
+	statistics->subscribers = ast_str_container_alloc(1);
+	if (!statistics->subscribers) {
+		ao2_ref(statistics, -1);
+		return NULL;
+	}
+
+	/* This is strictly used for the pointer address when showing the topic */
+	statistics->topic = topic;
+	strcpy(statistics->name, topic->name); /* SAFE */
+	ao2_link(topic_statistics, statistics);
+
+	return statistics;
+}
+#endif
 
 struct stasis_topic *stasis_topic_create(const char *name)
 {
 	struct stasis_topic *topic;
 	int res = 0;
 
-	topic = ao2_t_alloc(sizeof(*topic), topic_dtor, name);
+	topic = ao2_t_alloc(sizeof(*topic) + strlen(name) + 1, topic_dtor, name);
 	if (!topic) {
 		return NULL;
 	}
 
-	topic->name = ast_strdup(name);
+	strcpy(topic->name, name); /* SAFE */
 	res |= AST_VECTOR_INIT(&topic->subscribers, INITIAL_SUBSCRIBERS_MAX);
 	res |= AST_VECTOR_INIT(&topic->upstream_topics, 0);
-	if (!topic->name || res) {
-		ao2_cleanup(topic);
+	ast_debug(1, "Topic '%s': %p created\n", topic->name, topic);
+
+#ifdef AST_DEVMODE
+	topic->statistics = stasis_topic_statistics_create(topic);
+	if (!topic->name || !topic->statistics || res)
+#else
+	if (!topic->name || res)
+#endif
+	{
+		ao2_ref(topic, -1);
 		return NULL;
 	}
 
@@ -370,10 +476,46 @@ const char *stasis_topic_name(const struct stasis_topic *topic)
 	return topic->name;
 }
 
+size_t stasis_topic_subscribers(const struct stasis_topic *topic)
+{
+	return AST_VECTOR_SIZE(&topic->subscribers);
+}
+
+#ifdef AST_DEVMODE
+struct stasis_subscription_statistics {
+	/*! \brief The filename where the subscription originates */
+	const char *file;
+	/*! \brief The function where the subscription originates */
+	const char *func;
+	/*! \brief Names of the topics we are subscribed to */
+	struct ao2_container *topics;
+	/*! \brief The message type that currently took the longest to process */
+	struct stasis_message_type *highest_time_message_type;
+	/*! \brief Highest time spent invoking a message */
+	long highest_time_invoked;
+	/*! \brief Lowest time spent invoking a message */
+	long lowest_time_invoked;
+	/*! \brief The number of messages that were filtered out */
+	int messages_dropped;
+	/*! \brief The number of messages that passed filtering */
+	int messages_passed;
+	/*! \brief Using a mailbox to queue messages */
+	int uses_mailbox;
+	/*! \brief Using stasis threadpool for handling messages */
+	int uses_threadpool;
+	/*! \brief The line number where the subscription originates */
+	int lineno;
+	/*! \brief Pointer to the subscription (NOT refcounted, and must NOT be accessed) */
+	struct stasis_subscription *sub;
+	/*! \brief Unique ID of the subscription */
+	char uniqueid[0];
+};
+#endif
+
 /*! \internal */
 struct stasis_subscription {
 	/*! Unique ID for this subscription */
-	char uniqueid[AST_UUID_STR_LEN];
+	char *uniqueid;
 	/*! Topic subscribed to. */
 	struct stasis_topic *topic;
 	/*! Mailbox for processing incoming messages. */
@@ -391,6 +533,18 @@ struct stasis_subscription {
 	/*! Flag set when final message for sub has been processed.
 	 *  Be sure join_lock is held before reading/setting. */
 	int final_message_processed;
+
+	/*! The message types this subscription is accepting */
+	AST_VECTOR(, char) accepted_message_types;
+	/*! The message formatters this subscription is accepting */
+	enum stasis_subscription_message_formatters accepted_formatters;
+	/*! The message filter currently in use */
+	enum stasis_subscription_message_filter filter;
+
+#ifdef AST_DEVMODE
+	/*! Statistics information */
+	struct stasis_subscription_statistics *statistics;
+#endif
 };
 
 static void subscription_dtor(void *obj)
@@ -404,11 +558,21 @@ static void subscription_dtor(void *obj)
 	 * be bad. */
 	ast_assert(stasis_subscription_is_done(sub));
 
+	ast_free(sub->uniqueid);
 	ao2_cleanup(sub->topic);
 	sub->topic = NULL;
 	ast_taskprocessor_unreference(sub->mailbox);
 	sub->mailbox = NULL;
 	ast_cond_destroy(&sub->join_cond);
+
+	AST_VECTOR_FREE(&sub->accepted_message_types);
+
+#ifdef AST_DEVMODE
+	if (sub->statistics) {
+		ao2_unlink(subscription_statistics, sub->statistics);
+		ao2_ref(sub->statistics, -1);
+	}
+#endif
 }
 
 /*!
@@ -420,24 +584,53 @@ static void subscription_dtor(void *obj)
 static void subscription_invoke(struct stasis_subscription *sub,
 				  struct stasis_message *message)
 {
+	unsigned int final = stasis_subscription_final_message(sub, message);
+	int message_type_id = stasis_message_type_id(stasis_subscription_change_type());
+#ifdef AST_DEVMODE
+	struct timeval start;
+	long elapsed;
+
+	start = ast_tvnow();
+#endif
+
 	/* Notify that the final message has been received */
-	if (stasis_subscription_final_message(sub, message)) {
+	if (final) {
 		ao2_lock(sub);
 		sub->final_message_rxed = 1;
 		ast_cond_signal(&sub->join_cond);
 		ao2_unlock(sub);
 	}
 
-	/* Since sub is mostly immutable, no need to lock sub */
-	sub->callback(sub->data, sub, message);
+	/*
+	 * If filtering is turned on and this is a 'final' message, we only invoke the callback
+	 * if the subscriber accepts subscription_change message types.
+	 */
+	if (!final || sub->filter != STASIS_SUBSCRIPTION_FILTER_SELECTIVE ||
+		(message_type_id < AST_VECTOR_SIZE(&sub->accepted_message_types) && AST_VECTOR_GET(&sub->accepted_message_types, message_type_id))) {
+		/* Since sub is mostly immutable, no need to lock sub */
+		sub->callback(sub->data, sub, message);
+	}
 
 	/* Notify that the final message has been processed */
-	if (stasis_subscription_final_message(sub, message)) {
+	if (final) {
 		ao2_lock(sub);
 		sub->final_message_processed = 1;
 		ast_cond_signal(&sub->join_cond);
 		ao2_unlock(sub);
 	}
+
+#ifdef AST_DEVMODE
+	elapsed = ast_tvdiff_ms(ast_tvnow(), start);
+	if (elapsed > sub->statistics->highest_time_invoked) {
+		sub->statistics->highest_time_invoked = elapsed;
+		ao2_lock(sub->statistics);
+		sub->statistics->highest_time_message_type = stasis_message_type(message);
+		ao2_unlock(sub->statistics);
+	}
+	if (elapsed < sub->statistics->lowest_time_invoked) {
+		sub->statistics->lowest_time_invoked = elapsed;
+	}
+#endif
 }
 
 static void send_subscription_subscribe(struct stasis_topic *topic, struct stasis_subscription *sub);
@@ -447,14 +640,56 @@ void stasis_subscription_cb_noop(void *data, struct stasis_subscription *sub, st
 {
 }
 
+#ifdef AST_DEVMODE
+static void subscription_statistics_destroy(void *obj)
+{
+	struct stasis_subscription_statistics *statistics = obj;
+
+	ao2_cleanup(statistics->topics);
+}
+
+static struct stasis_subscription_statistics *stasis_subscription_statistics_create(struct stasis_subscription *sub,
+	int needs_mailbox, int use_thread_pool, const char *file, int lineno,
+	const char *func)
+{
+	struct stasis_subscription_statistics *statistics;
+
+	statistics = ao2_alloc(sizeof(*statistics) + strlen(sub->uniqueid) + 1, subscription_statistics_destroy);
+	if (!statistics) {
+		return NULL;
+	}
+
+	statistics->topics = ast_str_container_alloc(1);
+	if (!statistics->topics) {
+		ao2_ref(statistics, -1);
+		return NULL;
+	}
+
+	statistics->file = file;
+	statistics->lineno = lineno;
+	statistics->func = func;
+	statistics->uses_mailbox = needs_mailbox;
+	statistics->uses_threadpool = use_thread_pool;
+	strcpy(statistics->uniqueid, sub->uniqueid); /* SAFE */
+	statistics->sub = sub;
+	ao2_link(subscription_statistics, statistics);
+
+	return statistics;
+}
+#endif
+
 struct stasis_subscription *internal_stasis_subscribe(
 	struct stasis_topic *topic,
 	stasis_subscription_cb callback,
 	void *data,
 	int needs_mailbox,
-	int use_thread_pool)
+	int use_thread_pool,
+	const char *file,
+	int lineno,
+	const char *func)
 {
 	struct stasis_subscription *sub;
+	int ret;
 
 	if (!topic) {
 		return NULL;
@@ -465,13 +700,27 @@ struct stasis_subscription *internal_stasis_subscribe(
 	if (!sub) {
 		return NULL;
 	}
-	ast_uuid_generate_str(sub->uniqueid, sizeof(sub->uniqueid));
+
+#ifdef AST_DEVMODE
+	ret = ast_asprintf(&sub->uniqueid, "%s:%s-%d", file, stasis_topic_name(topic), ast_atomic_fetchadd_int(&topic->subscriber_id, +1));
+	sub->statistics = stasis_subscription_statistics_create(sub, needs_mailbox, use_thread_pool, file, lineno, func);
+	if (ret < 0 || !sub->statistics) {
+		ao2_ref(sub, -1);
+		return NULL;
+	}
+#else
+	ret = ast_asprintf(&sub->uniqueid, "%s-%d", stasis_topic_name(topic), ast_atomic_fetchadd_int(&topic->subscriber_id, +1));
+	if (ret < 0) {
+		ao2_ref(sub, -1);
+		return NULL;
+	}
+#endif
 
 	if (needs_mailbox) {
 		char tps_name[AST_TASKPROCESSOR_MAX_NAME + 1];
 
 		/* Create name with seq number appended. */
-		ast_taskprocessor_build_name(tps_name, sizeof(tps_name), "sub%c:%s",
+		ast_taskprocessor_build_name(tps_name, sizeof(tps_name), "stasis/%c:%s",
 			use_thread_pool ? 'p' : 'm',
 			stasis_topic_name(topic));
 
@@ -500,9 +749,13 @@ struct stasis_subscription *internal_stasis_subscribe(
 	sub->callback = callback;
 	sub->data = data;
 	ast_cond_init(&sub->join_cond, NULL);
+	sub->filter = STASIS_SUBSCRIPTION_FILTER_NONE;
+	AST_VECTOR_INIT(&sub->accepted_message_types, 0);
+	sub->accepted_formatters = STASIS_SUBSCRIPTION_FORMATTER_NONE;
 
 	if (topic_add_subscription(topic, sub) != 0) {
 		ao2_ref(sub, -1);
+		ao2_ref(topic, -1);
 
 		return NULL;
 	}
@@ -511,20 +764,26 @@ struct stasis_subscription *internal_stasis_subscribe(
 	return sub;
 }
 
-struct stasis_subscription *stasis_subscribe(
+struct stasis_subscription *__stasis_subscribe(
 	struct stasis_topic *topic,
 	stasis_subscription_cb callback,
-	void *data)
+	void *data,
+	const char *file,
+	int lineno,
+	const char *func)
 {
-	return internal_stasis_subscribe(topic, callback, data, 1, 0);
+	return internal_stasis_subscribe(topic, callback, data, 1, 0, file, lineno, func);
 }
 
-struct stasis_subscription *stasis_subscribe_pool(
+struct stasis_subscription *__stasis_subscribe_pool(
 	struct stasis_topic *topic,
 	stasis_subscription_cb callback,
-	void *data)
+	void *data,
+	const char *file,
+	int lineno,
+	const char *func)
 {
-	return internal_stasis_subscribe(topic, callback, data, 1, 1);
+	return internal_stasis_subscribe(topic, callback, data, 1, 1, file, lineno, func);
 }
 
 static int sub_cleanup(void *data)
@@ -561,7 +820,10 @@ struct stasis_subscription *stasis_unsubscribe(struct stasis_subscription *sub)
 
 	/* When all that's done, remove the ref the mailbox has on the sub */
 	if (sub->mailbox) {
-		ast_taskprocessor_push(sub->mailbox, sub_cleanup, sub);
+		if (ast_taskprocessor_push(sub->mailbox, sub_cleanup, sub)) {
+			/* Nothing we can do here, the conditional is just to keep
+			 * the compiler happy that we're not ignoring the result. */
+		}
 	}
 
 	/* Unsubscribing unrefs the subscription */
@@ -581,6 +843,88 @@ int stasis_subscription_set_congestion_limits(struct stasis_subscription *subscr
 			low_water, high_water);
 	}
 	return res;
+}
+
+int stasis_subscription_accept_message_type(struct stasis_subscription *subscription,
+	const struct stasis_message_type *type)
+{
+	if (!subscription) {
+		return -1;
+	}
+
+	ast_assert(type != NULL);
+	ast_assert(stasis_message_type_name(type) != NULL);
+
+	if (!type || !stasis_message_type_name(type)) {
+		/* Filtering is unreliable as this message type is not yet initialized
+		 * so force all messages through.
+		 */
+		subscription->filter = STASIS_SUBSCRIPTION_FILTER_FORCED_NONE;
+		return 0;
+	}
+
+	ao2_lock(subscription->topic);
+	if (AST_VECTOR_REPLACE(&subscription->accepted_message_types, stasis_message_type_id(type), 1)) {
+		/* We do this for the same reason as above. The subscription can still operate, so allow
+		 * it to do so by forcing all messages through.
+		 */
+		subscription->filter = STASIS_SUBSCRIPTION_FILTER_FORCED_NONE;
+	}
+	ao2_unlock(subscription->topic);
+
+	return 0;
+}
+
+int stasis_subscription_decline_message_type(struct stasis_subscription *subscription,
+	const struct stasis_message_type *type)
+{
+	if (!subscription) {
+		return -1;
+	}
+
+	ast_assert(type != NULL);
+	ast_assert(stasis_message_type_name(type) != NULL);
+
+	if (!type || !stasis_message_type_name(type)) {
+		return 0;
+	}
+
+	ao2_lock(subscription->topic);
+	if (stasis_message_type_id(type) < AST_VECTOR_SIZE(&subscription->accepted_message_types)) {
+		/* The memory is already allocated so this can't fail */
+		AST_VECTOR_REPLACE(&subscription->accepted_message_types, stasis_message_type_id(type), 0);
+	}
+	ao2_unlock(subscription->topic);
+
+	return 0;
+}
+
+int stasis_subscription_set_filter(struct stasis_subscription *subscription,
+	enum stasis_subscription_message_filter filter)
+{
+	if (!subscription) {
+		return -1;
+	}
+
+	ao2_lock(subscription->topic);
+	if (subscription->filter != STASIS_SUBSCRIPTION_FILTER_FORCED_NONE) {
+		subscription->filter = filter;
+	}
+	ao2_unlock(subscription->topic);
+
+	return 0;
+}
+
+void stasis_subscription_accept_formatters(struct stasis_subscription *subscription,
+	enum stasis_subscription_message_formatters formatters)
+{
+	ast_assert(subscription != NULL);
+
+	ao2_lock(subscription->topic);
+	subscription->accepted_formatters = formatters;
+	ao2_unlock(subscription->topic);
+
+	return;
 }
 
 void stasis_subscription_join(struct stasis_subscription *subscription)
@@ -696,6 +1040,12 @@ static int topic_add_subscription(struct stasis_topic *topic, struct stasis_subs
 		topic_add_subscription(
 			AST_VECTOR_GET(&topic->upstream_topics, idx), sub);
 	}
+
+#ifdef AST_DEVMODE
+	ast_str_container_add(topic->statistics->subscribers, stasis_subscription_uniqueid(sub));
+	ast_str_container_add(sub->statistics->topics, stasis_topic_name(topic));
+#endif
+
 	ao2_unlock(topic);
 
 	return 0;
@@ -713,6 +1063,14 @@ static int topic_remove_subscription(struct stasis_topic *topic, struct stasis_s
 	}
 	res = AST_VECTOR_REMOVE_ELEM_UNORDERED(&topic->subscribers, sub,
 		AST_VECTOR_ELEM_CLEANUP_NOOP);
+
+#ifdef AST_DEVMODE
+	if (!res) {
+		ast_str_container_remove(topic->statistics->subscribers, stasis_subscription_uniqueid(sub));
+		ast_str_container_remove(sub->statistics->topics, stasis_topic_name(topic));
+	}
+#endif
+
 	ao2_unlock(topic);
 
 	return res;
@@ -773,15 +1131,77 @@ static int dispatch_exec_sync(struct ast_taskprocessor_local *local)
  * \param message The message to send
  * \param synchronous If non-zero, synchronize on the subscriber receiving
  * the message
+ * \retval 0 if message was not dispatched
+ * \retval 1 if message was dispatched
  */
-static void dispatch_message(struct stasis_subscription *sub,
+static unsigned int dispatch_message(struct stasis_subscription *sub,
 	struct stasis_message *message,
 	int synchronous)
 {
+	int is_final = stasis_subscription_final_message(sub, message);
+
+	/*
+	 * The 'do while' gives us an easy way to skip remaining logic once
+	 * we determine the message should be accepted.
+	 * The code looks more verbose than it needs to be but it optimizes
+	 * down very nicely.  It's just easier to understand and debug this way.
+	 */
+	do {
+		struct stasis_message_type *message_type = stasis_message_type(message);
+		int type_id = stasis_message_type_id(message_type);
+		int type_filter_specified = 0;
+		int formatter_filter_specified = 0;
+		int type_filter_passed = 0;
+		int formatter_filter_passed = 0;
+
+		/* We always accept final messages so only run the filter logic if not final */
+		if (is_final) {
+			break;
+		}
+
+		type_filter_specified = sub->filter & STASIS_SUBSCRIPTION_FILTER_SELECTIVE;
+		formatter_filter_specified = sub->accepted_formatters != STASIS_SUBSCRIPTION_FORMATTER_NONE;
+
+		/* Accept if no filters of either type were specified */
+		if (!type_filter_specified && !formatter_filter_specified) {
+			break;
+		}
+
+		type_filter_passed = type_filter_specified
+			&& type_id < AST_VECTOR_SIZE(&sub->accepted_message_types)
+			&& AST_VECTOR_GET(&sub->accepted_message_types, type_id);
+
+		/*
+		 * Since the type and formatter filters are OR'd, we can skip
+		 * the formatter check if the type check passes.
+		 */
+		if (type_filter_passed) {
+			break;
+		}
+
+		formatter_filter_passed = formatter_filter_specified
+			&& (sub->accepted_formatters & stasis_message_type_available_formatters(message_type));
+
+		if (formatter_filter_passed) {
+			break;
+		}
+
+#ifdef AST_DEVMODE
+		ast_atomic_fetchadd_int(&sub->statistics->messages_dropped, +1);
+#endif
+
+		return 0;
+
+	} while (0);
+
+#ifdef AST_DEVMODE
+	ast_atomic_fetchadd_int(&sub->statistics->messages_passed, +1);
+#endif
+
 	if (!sub->mailbox) {
 		/* Dispatch directly */
 		subscription_invoke(sub, message);
-		return;
+		return 1;
 	}
 
 	/* Bump the message for the taskprocessor push. This will get de-ref'd
@@ -793,6 +1213,7 @@ static void dispatch_message(struct stasis_subscription *sub,
 			/* Push failed; ugh. */
 			ast_log(LOG_ERROR, "Dropping async dispatch\n");
 			ao2_cleanup(message);
+			return 0;
 		}
 	} else {
 		struct sync_task_data std;
@@ -808,7 +1229,7 @@ static void dispatch_message(struct stasis_subscription *sub,
 			ao2_cleanup(message);
 			ast_mutex_destroy(&std.lock);
 			ast_cond_destroy(&std.cond);
-			return;
+			return 0;
 		}
 
 		ast_mutex_lock(&std.lock);
@@ -820,6 +1241,8 @@ static void dispatch_message(struct stasis_subscription *sub,
 		ast_mutex_destroy(&std.lock);
 		ast_cond_destroy(&std.cond);
 	}
+
+	return 1;
 }
 
 /*!
@@ -833,24 +1256,78 @@ static void publish_msg(struct stasis_topic *topic,
 	struct stasis_message *message, struct stasis_subscription *sync_sub)
 {
 	size_t i;
+	unsigned int dispatched = 0;
+#ifdef AST_DEVMODE
+	int message_type_id = stasis_message_type_id(stasis_message_type(message));
+	struct stasis_message_type_statistics *statistics;
+	struct timeval start;
+	long elapsed;
+#endif
 
 	ast_assert(topic != NULL);
 	ast_assert(message != NULL);
+
+#ifdef AST_DEVMODE
+	ast_mutex_lock(&message_type_statistics_lock);
+	if (message_type_id >= AST_VECTOR_SIZE(&message_type_statistics)) {
+		struct stasis_message_type_statistics new_statistics = {
+			.published = 0,
+		};
+		if (AST_VECTOR_REPLACE(&message_type_statistics, message_type_id, new_statistics)) {
+			ast_mutex_unlock(&message_type_statistics_lock);
+			return;
+		}
+	}
+	statistics = AST_VECTOR_GET_ADDR(&message_type_statistics, message_type_id);
+	statistics->message_type = stasis_message_type(message);
+	ast_mutex_unlock(&message_type_statistics_lock);
+
+	ast_atomic_fetchadd_int(&statistics->published, +1);
+#endif
+
+	/* If there are no subscribers don't bother */
+	if (!stasis_topic_subscribers(topic)) {
+#ifdef AST_DEVMODE
+		ast_atomic_fetchadd_int(&statistics->unused, +1);
+		ast_atomic_fetchadd_int(&topic->statistics->messages_not_dispatched, +1);
+#endif
+		return;
+	}
 
 	/*
 	 * The topic may be unref'ed by the subscription invocation.
 	 * Make sure we hold onto a reference while dispatching.
 	 */
 	ao2_ref(topic, +1);
+#ifdef AST_DEVMODE
+	start = ast_tvnow();
+#endif
 	ao2_lock(topic);
 	for (i = 0; i < AST_VECTOR_SIZE(&topic->subscribers); ++i) {
 		struct stasis_subscription *sub = AST_VECTOR_GET(&topic->subscribers, i);
 
 		ast_assert(sub != NULL);
 
-		dispatch_message(sub, message, (sub == sync_sub));
+		dispatched += dispatch_message(sub, message, (sub == sync_sub));
 	}
 	ao2_unlock(topic);
+
+#ifdef AST_DEVMODE
+	elapsed = ast_tvdiff_ms(ast_tvnow(), start);
+	if (elapsed > topic->statistics->highest_time_dispatched) {
+		topic->statistics->highest_time_dispatched = elapsed;
+	}
+	if (elapsed < topic->statistics->lowest_time_dispatched) {
+		topic->statistics->lowest_time_dispatched = elapsed;
+	}
+	if (dispatched) {
+		ast_atomic_fetchadd_int(&topic->statistics->messages_dispatched, +1);
+	} else {
+		ast_atomic_fetchadd_int(&statistics->unused, +1);
+		ast_atomic_fetchadd_int(&topic->statistics->messages_not_dispatched, +1);
+	}
+#endif
+
 	ao2_ref(topic, -1);
 }
 
@@ -967,22 +1444,23 @@ static void subscription_change_dtor(void *obj)
 {
 	struct stasis_subscription_change *change = obj;
 
-	ast_string_field_free_memory(change);
 	ao2_cleanup(change->topic);
 }
 
 static struct stasis_subscription_change *subscription_change_alloc(struct stasis_topic *topic, const char *uniqueid, const char *description)
 {
+	size_t description_len = strlen(description) + 1;
 	struct stasis_subscription_change *change;
 
-	change = ao2_alloc(sizeof(struct stasis_subscription_change), subscription_change_dtor);
-	if (!change || ast_string_field_init(change, 128)) {
-		ao2_cleanup(change);
+	change = ao2_alloc_options(sizeof(*change) + description_len + strlen(uniqueid) + 1,
+		subscription_change_dtor, AO2_ALLOC_OPT_LOCK_NOLOCK);
+	if (!change) {
 		return NULL;
 	}
 
-	ast_string_field_set(change, uniqueid, uniqueid);
-	ast_string_field_set(change, description, description);
+	strcpy(change->description, description); /* SAFE */
+	change->uniqueid = change->description + description_len;
+	strcpy(change->uniqueid, uniqueid); /* SAFE */
 	ao2_ref(topic, +1);
 	change->topic = topic;
 
@@ -1053,6 +1531,7 @@ static void send_subscription_unsubscribe(struct stasis_topic *topic,
 struct topic_pool_entry {
 	struct stasis_forward *forward;
 	struct stasis_topic *topic;
+	char name[0];
 };
 
 static void topic_pool_entry_dtor(void *obj)
@@ -1064,10 +1543,19 @@ static void topic_pool_entry_dtor(void *obj)
 	entry->topic = NULL;
 }
 
-static struct topic_pool_entry *topic_pool_entry_alloc(void)
+static struct topic_pool_entry *topic_pool_entry_alloc(const char *topic_name)
 {
-	return ao2_alloc_options(sizeof(struct topic_pool_entry), topic_pool_entry_dtor,
-		AO2_ALLOC_OPT_LOCK_NOLOCK);
+	struct topic_pool_entry *topic_pool_entry;
+
+	topic_pool_entry = ao2_alloc_options(sizeof(*topic_pool_entry) + strlen(topic_name) + 1,
+		topic_pool_entry_dtor, AO2_ALLOC_OPT_LOCK_NOLOCK);
+	if (!topic_pool_entry) {
+		return NULL;
+	}
+
+	strcpy(topic_pool_entry->name, topic_name); /* Safe */
+
+	return topic_pool_entry;
 }
 
 struct stasis_topic_pool {
@@ -1078,6 +1566,15 @@ struct stasis_topic_pool {
 static void topic_pool_dtor(void *obj)
 {
 	struct stasis_topic_pool *pool = obj;
+
+#ifdef AO2_DEBUG
+	{
+		char *container_name =
+			ast_alloca(strlen(stasis_topic_name(pool->pool_topic)) + strlen("-pool") + 1);
+		sprintf(container_name, "%s-pool", stasis_topic_name(pool->pool_topic));
+		ao2_container_unregister(container_name);
+	}
+#endif
 
 	ao2_cleanup(pool->pool_container);
 	pool->pool_container = NULL;
@@ -1096,7 +1593,7 @@ static int topic_pool_entry_hash(const void *obj, const int flags)
 		break;
 	case OBJ_SEARCH_OBJECT:
 		object = obj;
-		key = stasis_topic_name(object->topic);
+		key = object->name;
 		break;
 	default:
 		/* Hash can only work on something with a full key. */
@@ -1115,10 +1612,10 @@ static int topic_pool_entry_cmp(void *obj, void *arg, int flags)
 
 	switch (flags & OBJ_SEARCH_MASK) {
 	case OBJ_SEARCH_OBJECT:
-		right_key = stasis_topic_name(object_right->topic);
+		right_key = object_right->name;
 		/* Fall through */
 	case OBJ_SEARCH_KEY:
-		cmp = strcasecmp(stasis_topic_name(object_left->topic), right_key);
+		cmp = strcasecmp(object_left->name, right_key);
 		break;
 	case OBJ_SEARCH_PARTIAL_KEY:
 		/* Not supported by container */
@@ -1143,6 +1640,18 @@ static int topic_pool_entry_cmp(void *obj, void *arg, int flags)
 	return CMP_MATCH;
 }
 
+#ifdef AO2_DEBUG
+static void topic_pool_prnt_obj(void *v_obj, void *where, ao2_prnt_fn *prnt)
+{
+	struct topic_pool_entry *entry = v_obj;
+
+	if (!entry) {
+		return;
+	}
+	prnt(where, "%s", stasis_topic_name(entry->topic));
+}
+#endif
+
 struct stasis_topic_pool *stasis_topic_pool_create(struct stasis_topic *pooled_topic)
 {
 	struct stasis_topic_pool *pool;
@@ -1152,34 +1661,60 @@ struct stasis_topic_pool *stasis_topic_pool_create(struct stasis_topic *pooled_t
 		return NULL;
 	}
 
-	pool->pool_container = ao2_container_alloc(TOPIC_POOL_BUCKETS,
-		topic_pool_entry_hash, topic_pool_entry_cmp);
+	pool->pool_container = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		TOPIC_POOL_BUCKETS, topic_pool_entry_hash, NULL, topic_pool_entry_cmp);
 	if (!pool->pool_container) {
 		ao2_cleanup(pool);
 		return NULL;
 	}
+
+#ifdef AO2_DEBUG
+	{
+		char *container_name =
+			ast_alloca(strlen(stasis_topic_name(pooled_topic)) + strlen("-pool") + 1);
+		sprintf(container_name, "%s-pool", stasis_topic_name(pooled_topic));
+		ao2_container_register(container_name, pool->pool_container, topic_pool_prnt_obj);
+	}
+#endif
+
 	ao2_ref(pooled_topic, +1);
 	pool->pool_topic = pooled_topic;
 
 	return pool;
 }
 
+void stasis_topic_pool_delete_topic(struct stasis_topic_pool *pool, const char *topic_name)
+{
+	ao2_find(pool->pool_container, topic_name, OBJ_SEARCH_KEY | OBJ_NODATA | OBJ_UNLINK);
+}
+
 struct stasis_topic *stasis_topic_pool_get_topic(struct stasis_topic_pool *pool, const char *topic_name)
 {
 	RAII_VAR(struct topic_pool_entry *, topic_pool_entry, NULL, ao2_cleanup);
 	SCOPED_AO2LOCK(topic_container_lock, pool->pool_container);
+	char *new_topic_name;
+	int ret;
 
 	topic_pool_entry = ao2_find(pool->pool_container, topic_name, OBJ_SEARCH_KEY | OBJ_NOLOCK);
 	if (topic_pool_entry) {
 		return topic_pool_entry->topic;
 	}
 
-	topic_pool_entry = topic_pool_entry_alloc();
+	topic_pool_entry = topic_pool_entry_alloc(topic_name);
 	if (!topic_pool_entry) {
 		return NULL;
 	}
 
-	topic_pool_entry->topic = stasis_topic_create(topic_name);
+	/* To provide further detail and to ensure that the topic is unique within the scope of the
+	 * system we prefix it with the pooling topic name, which should itself already be unique.
+	 */
+	ret = ast_asprintf(&new_topic_name, "%s/%s", stasis_topic_name(pool->pool_topic), topic_name);
+	if (ret < 0) {
+		return NULL;
+	}
+
+	topic_pool_entry->topic = stasis_topic_create(new_topic_name);
+	ast_free(new_topic_name);
 	if (!topic_pool_entry->topic) {
 		return NULL;
 	}
@@ -1196,10 +1731,25 @@ struct stasis_topic *stasis_topic_pool_get_topic(struct stasis_topic_pool *pool,
 	return topic_pool_entry->topic;
 }
 
+int stasis_topic_pool_topic_exists(const struct stasis_topic_pool *pool, const char *topic_name)
+{
+	struct topic_pool_entry *topic_pool_entry;
+
+	topic_pool_entry = ao2_find(pool->pool_container, topic_name, OBJ_SEARCH_KEY);
+	if (!topic_pool_entry) {
+		return 0;
+	}
+
+	ao2_ref(topic_pool_entry, -1);
+	return 1;
+}
+
 void stasis_log_bad_type_access(const char *name)
 {
 #ifdef AST_DEVMODE
-	ast_log(LOG_ERROR, "Use of %s() before init/after destruction\n", name);
+	if (!stasis_message_type_declined(name)) {
+		ast_log(LOG_ERROR, "Use of %s() before init/after destruction\n", name);
+	}
 #endif
 }
 
@@ -1317,8 +1867,8 @@ static struct ast_json *multi_user_event_to_json(
 
 	ast_json_object_set(out, "type", ast_json_string_create("ChannelUserevent"));
 	ast_json_object_set(out, "timestamp", ast_json_timeval(*tv, NULL));
-	ast_json_object_set(out, "eventname", ast_json_string_create(ast_json_string_get((ast_json_object_get(blob, "eventname")))));
-	ast_json_object_set(out, "userevent", ast_json_deep_copy(blob));
+	ast_json_object_set(out, "eventname", ast_json_ref(ast_json_object_get(blob, "eventname")));
+	ast_json_object_set(out, "userevent", ast_json_ref(blob));
 
 	for (type = 0; type < STASIS_UMOS_MAX; ++type) {
 		for (i = 0; i < AST_VECTOR_SIZE(&multi->snapshots[type]); ++i) {
@@ -1584,9 +2134,518 @@ STASIS_MESSAGE_TYPE_DEFN(ast_multi_user_event_type,
 
 /*! @} */
 
+#ifdef AST_DEVMODE
+
+AO2_STRING_FIELD_SORT_FN(stasis_subscription_statistics, uniqueid);
+
+/*!
+ * \internal
+ * \brief CLI command implementation for 'stasis statistics show subscriptions'
+ */
+static char *statistics_show_subscriptions(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct ao2_container *sorted_subscriptions;
+	struct ao2_iterator iter;
+	struct stasis_subscription_statistics *statistics;
+	int count = 0;
+	int dropped = 0;
+	int passed = 0;
+#define FMT_HEADERS		"%-64s %10s %10s %16s %16s\n"
+#define FMT_FIELDS		"%-64s %10d %10d %16ld %16ld\n"
+#define FMT_FIELDS2		"%-64s %10d %10d\n"
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "stasis statistics show subscriptions";
+		e->usage =
+			"Usage: stasis statistics show subscriptions\n"
+			"	Shows a list of subscriptions and their general statistics\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc != e->args) {
+		return CLI_SHOWUSAGE;
+	}
+
+	sorted_subscriptions = ao2_container_alloc_rbtree(AO2_ALLOC_OPT_LOCK_NOLOCK, 0,
+		stasis_subscription_statistics_sort_fn, NULL);
+	if (!sorted_subscriptions) {
+		ast_cli(a->fd, "Could not create container for sorting subscription statistics\n");
+		return CLI_SUCCESS;
+	}
+
+	if (ao2_container_dup(sorted_subscriptions, subscription_statistics, 0)) {
+		ao2_ref(sorted_subscriptions, -1);
+		ast_cli(a->fd, "Could not sort subscription statistics\n");
+		return CLI_SUCCESS;
+	}
+
+	ast_cli(a->fd, "\n" FMT_HEADERS, "Subscription", "Dropped", "Passed", "Lowest Invoke", "Highest Invoke");
+
+	iter = ao2_iterator_init(sorted_subscriptions, 0);
+	while ((statistics = ao2_iterator_next(&iter))) {
+		ast_cli(a->fd, FMT_FIELDS, statistics->uniqueid, statistics->messages_dropped, statistics->messages_passed,
+			statistics->lowest_time_invoked, statistics->highest_time_invoked);
+		dropped += statistics->messages_dropped;
+		passed += statistics->messages_passed;
+		ao2_ref(statistics, -1);
+		++count;
+	}
+	ao2_iterator_destroy(&iter);
+
+	ao2_ref(sorted_subscriptions, -1);
+
+	ast_cli(a->fd, FMT_FIELDS2, "Total", dropped, passed);
+	ast_cli(a->fd, "\n%d subscriptions\n\n", count);
+
+#undef FMT_HEADERS
+#undef FMT_FIELDS
+#undef FMT_FIELDS2
+
+	return CLI_SUCCESS;
+}
+
+/*!
+ * \internal
+ * \brief CLI tab completion for subscription statistics names
+ */
+static char *subscription_statistics_complete_name(const char *word, int state)
+{
+	struct stasis_subscription_statistics *statistics;
+	struct ao2_iterator it_statistics;
+	int wordlen = strlen(word);
+	int which = 0;
+	char *result = NULL;
+
+	it_statistics = ao2_iterator_init(subscription_statistics, 0);
+	while ((statistics = ao2_iterator_next(&it_statistics))) {
+		if (!strncasecmp(word, statistics->uniqueid, wordlen)
+			&& ++which > state) {
+			result = ast_strdup(statistics->uniqueid);
+		}
+		ao2_ref(statistics, -1);
+		if (result) {
+			break;
+		}
+	}
+	ao2_iterator_destroy(&it_statistics);
+	return result;
+}
+
+/*!
+ * \internal
+ * \brief CLI command implementation for 'stasis statistics show subscription'
+ */
+static char *statistics_show_subscription(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct stasis_subscription_statistics *statistics;
+	struct ao2_iterator i;
+	char *name;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "stasis statistics show subscription";
+		e->usage =
+		    "Usage: stasis statistics show subscription <uniqueid>\n"
+		    "       Show stasis subscription statistics.\n";
+		return NULL;
+	case CLI_GENERATE:
+		if (a->pos == 4) {
+			return subscription_statistics_complete_name(a->word, a->n);
+		} else {
+			return NULL;
+		}
+	}
+
+	if (a->argc != 5) {
+		return CLI_SHOWUSAGE;
+	}
+
+	statistics = ao2_find(subscription_statistics, a->argv[4], OBJ_SEARCH_KEY);
+	if (!statistics) {
+		ast_cli(a->fd, "Specified subscription '%s' does not exist\n", a->argv[4]);
+		return CLI_FAILURE;
+	}
+
+	ast_cli(a->fd, "Subscription: %s\n", statistics->uniqueid);
+	ast_cli(a->fd, "Pointer Address: %p\n", statistics->sub);
+	ast_cli(a->fd, "Source filename: %s\n", S_OR(statistics->file, "<unavailable>"));
+	ast_cli(a->fd, "Source line number: %d\n", statistics->lineno);
+	ast_cli(a->fd, "Source function: %s\n", S_OR(statistics->func, "<unavailable>"));
+	ast_cli(a->fd, "Number of messages dropped due to filtering: %d\n", statistics->messages_dropped);
+	ast_cli(a->fd, "Number of messages passed to subscriber callback: %d\n", statistics->messages_passed);
+	ast_cli(a->fd, "Using mailbox to queue messages: %s\n", statistics->uses_mailbox ? "Yes" : "No");
+	ast_cli(a->fd, "Using stasis threadpool for handling messages: %s\n", statistics->uses_threadpool ? "Yes" : "No");
+	ast_cli(a->fd, "Lowest amount of time (in milliseconds) spent invoking message: %ld\n", statistics->lowest_time_invoked);
+	ast_cli(a->fd, "Highest amount of time (in milliseconds) spent invoking message: %ld\n", statistics->highest_time_invoked);
+
+	ao2_lock(statistics);
+	if (statistics->highest_time_message_type) {
+		ast_cli(a->fd, "Offender message type for highest invoking time: %s\n", stasis_message_type_name(statistics->highest_time_message_type));
+	}
+	ao2_unlock(statistics);
+
+	ast_cli(a->fd, "Number of topics: %d\n", ao2_container_count(statistics->topics));
+
+	ast_cli(a->fd, "Subscribed topics:\n");
+	i = ao2_iterator_init(statistics->topics, 0);
+	while ((name = ao2_iterator_next(&i))) {
+		ast_cli(a->fd, "\t%s\n", name);
+		ao2_ref(name, -1);
+	}
+	ao2_iterator_destroy(&i);
+
+	ao2_ref(statistics, -1);
+
+	return CLI_SUCCESS;
+}
+
+AO2_STRING_FIELD_SORT_FN(stasis_topic_statistics, name);
+
+/*!
+ * \internal
+ * \brief CLI command implementation for 'stasis statistics show topics'
+ */
+static char *statistics_show_topics(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct ao2_container *sorted_topics;
+	struct ao2_iterator iter;
+	struct stasis_topic_statistics *statistics;
+	int count = 0;
+	int not_dispatched = 0;
+	int dispatched = 0;
+#define FMT_HEADERS		"%-64s %10s %10s %10s %16s %16s\n"
+#define FMT_FIELDS		"%-64s %10d %10d %10d %16ld %16ld\n"
+#define FMT_FIELDS2		"%-64s %10s %10d %10d\n"
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "stasis statistics show topics";
+		e->usage =
+			"Usage: stasis statistics show topics\n"
+			"	Shows a list of topics and their general statistics\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc != e->args) {
+		return CLI_SHOWUSAGE;
+	}
+
+	sorted_topics = ao2_container_alloc_rbtree(AO2_ALLOC_OPT_LOCK_NOLOCK, 0,
+		stasis_topic_statistics_sort_fn, NULL);
+	if (!sorted_topics) {
+		ast_cli(a->fd, "Could not create container for sorting topic statistics\n");
+		return CLI_SUCCESS;
+	}
+
+	if (ao2_container_dup(sorted_topics, topic_statistics, 0)) {
+		ao2_ref(sorted_topics, -1);
+		ast_cli(a->fd, "Could not sort topic statistics\n");
+		return CLI_SUCCESS;
+	}
+
+	ast_cli(a->fd, "\n" FMT_HEADERS, "Topic", "Subscribers", "Dropped", "Dispatched", "Lowest Dispatch", "Highest Dispatch");
+
+	iter = ao2_iterator_init(sorted_topics, 0);
+	while ((statistics = ao2_iterator_next(&iter))) {
+		ast_cli(a->fd, FMT_FIELDS, statistics->name, ao2_container_count(statistics->subscribers),
+			statistics->messages_not_dispatched, statistics->messages_dispatched,
+			statistics->lowest_time_dispatched, statistics->highest_time_dispatched);
+		not_dispatched += statistics->messages_not_dispatched;
+		dispatched += statistics->messages_dispatched;
+		ao2_ref(statistics, -1);
+		++count;
+	}
+	ao2_iterator_destroy(&iter);
+
+	ao2_ref(sorted_topics, -1);
+
+	ast_cli(a->fd, FMT_FIELDS2, "Total", "", not_dispatched, dispatched);
+	ast_cli(a->fd, "\n%d topics\n\n", count);
+
+#undef FMT_HEADERS
+#undef FMT_FIELDS
+#undef FMT_FIELDS2
+
+	return CLI_SUCCESS;
+}
+
+/*!
+ * \internal
+ * \brief CLI tab completion for topic statistics names
+ */
+static char *topic_statistics_complete_name(const char *word, int state)
+{
+	struct stasis_topic_statistics *statistics;
+	struct ao2_iterator it_statistics;
+	int wordlen = strlen(word);
+	int which = 0;
+	char *result = NULL;
+
+	it_statistics = ao2_iterator_init(topic_statistics, 0);
+	while ((statistics = ao2_iterator_next(&it_statistics))) {
+		if (!strncasecmp(word, statistics->name, wordlen)
+			&& ++which > state) {
+			result = ast_strdup(statistics->name);
+		}
+		ao2_ref(statistics, -1);
+		if (result) {
+			break;
+		}
+	}
+	ao2_iterator_destroy(&it_statistics);
+	return result;
+}
+
+/*!
+ * \internal
+ * \brief CLI command implementation for 'stasis statistics show topic'
+ */
+static char *statistics_show_topic(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct stasis_topic_statistics *statistics;
+	struct ao2_iterator i;
+	char *uniqueid;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "stasis statistics show topic";
+		e->usage =
+		    "Usage: stasis statistics show topic <name>\n"
+		    "       Show stasis topic statistics.\n";
+		return NULL;
+	case CLI_GENERATE:
+		if (a->pos == 4) {
+			return topic_statistics_complete_name(a->word, a->n);
+		} else {
+			return NULL;
+		}
+	}
+
+	if (a->argc != 5) {
+		return CLI_SHOWUSAGE;
+	}
+
+	statistics = ao2_find(topic_statistics, a->argv[4], OBJ_SEARCH_KEY);
+	if (!statistics) {
+		ast_cli(a->fd, "Specified topic '%s' does not exist\n", a->argv[4]);
+		return CLI_FAILURE;
+	}
+
+	ast_cli(a->fd, "Topic: %s\n", statistics->name);
+	ast_cli(a->fd, "Pointer Address: %p\n", statistics->topic);
+	ast_cli(a->fd, "Number of messages published that went to no subscriber: %d\n", statistics->messages_not_dispatched);
+	ast_cli(a->fd, "Number of messages that went to at least one subscriber: %d\n", statistics->messages_dispatched);
+	ast_cli(a->fd, "Lowest amount of time (in milliseconds) spent dispatching message: %ld\n", statistics->lowest_time_dispatched);
+	ast_cli(a->fd, "Highest amount of time (in milliseconds) spent dispatching messages: %ld\n", statistics->highest_time_dispatched);
+	ast_cli(a->fd, "Number of subscribers: %d\n", ao2_container_count(statistics->subscribers));
+
+	ast_cli(a->fd, "Subscribers:\n");
+	i = ao2_iterator_init(statistics->subscribers, 0);
+	while ((uniqueid = ao2_iterator_next(&i))) {
+		ast_cli(a->fd, "\t%s\n", uniqueid);
+		ao2_ref(uniqueid, -1);
+	}
+	ao2_iterator_destroy(&i);
+
+	ao2_ref(statistics, -1);
+
+	return CLI_SUCCESS;
+}
+
+/*!
+ * \internal
+ * \brief CLI command implementation for 'stasis statistics show messages'
+ */
+static char *statistics_show_messages(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	int i;
+	int count = 0;
+	int published = 0;
+	int unused = 0;
+#define FMT_HEADERS		"%-64s %10s %10s\n"
+#define FMT_FIELDS		"%-64s %10d %10d\n"
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "stasis statistics show messages";
+		e->usage =
+			"Usage: stasis statistics show messages\n"
+			"	Shows a list of message types and their general statistics\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc != e->args) {
+		return CLI_SHOWUSAGE;
+	}
+
+	ast_cli(a->fd, "\n" FMT_HEADERS, "Message Type", "Published", "Unused");
+
+	ast_mutex_lock(&message_type_statistics_lock);
+	for (i = 0; i < AST_VECTOR_SIZE(&message_type_statistics); ++i) {
+		struct stasis_message_type_statistics *statistics = AST_VECTOR_GET_ADDR(&message_type_statistics, i);
+
+		if (!statistics->message_type) {
+			continue;
+		}
+
+		ast_cli(a->fd, FMT_FIELDS, stasis_message_type_name(statistics->message_type), statistics->published,
+			statistics->unused);
+		published += statistics->published;
+		unused += statistics->unused;
+		++count;
+	}
+	ast_mutex_unlock(&message_type_statistics_lock);
+
+	ast_cli(a->fd, FMT_FIELDS, "Total", published, unused);
+	ast_cli(a->fd, "\n%d seen message types\n\n", count);
+
+#undef FMT_HEADERS
+#undef FMT_FIELDS
+
+	return CLI_SUCCESS;
+}
+
+static struct ast_cli_entry cli_stasis_statistics[] = {
+	AST_CLI_DEFINE(statistics_show_subscriptions, "Show subscriptions with general statistics"),
+	AST_CLI_DEFINE(statistics_show_subscription, "Show subscription statistics"),
+	AST_CLI_DEFINE(statistics_show_topics, "Show topics with general statistics"),
+	AST_CLI_DEFINE(statistics_show_topic, "Show topic statistics"),
+	AST_CLI_DEFINE(statistics_show_messages, "Show message types with general statistics"),
+};
+
+static int subscription_statistics_hash(const void *obj, const int flags)
+{
+	const struct stasis_subscription_statistics *object;
+	const char *key;
+
+	switch (flags & OBJ_SEARCH_MASK) {
+	case OBJ_SEARCH_KEY:
+		key = obj;
+		break;
+	case OBJ_SEARCH_OBJECT:
+		object = obj;
+		key = object->uniqueid;
+		break;
+	default:
+		/* Hash can only work on something with a full key. */
+		ast_assert(0);
+		return 0;
+	}
+	return ast_str_case_hash(key);
+}
+
+static int subscription_statistics_cmp(void *obj, void *arg, int flags)
+{
+	const struct stasis_subscription_statistics *object_left = obj;
+	const struct stasis_subscription_statistics *object_right = arg;
+	const char *right_key = arg;
+	int cmp;
+
+	switch (flags & OBJ_SEARCH_MASK) {
+	case OBJ_SEARCH_OBJECT:
+		right_key = object_right->uniqueid;
+		/* Fall through */
+	case OBJ_SEARCH_KEY:
+		cmp = strcasecmp(object_left->uniqueid, right_key);
+		break;
+	case OBJ_SEARCH_PARTIAL_KEY:
+		/* Not supported by container */
+		ast_assert(0);
+		cmp = -1;
+		break;
+	default:
+		/*
+		 * What arg points to is specific to this traversal callback
+		 * and has no special meaning to astobj2.
+		 */
+		cmp = 0;
+		break;
+	}
+	if (cmp) {
+		return 0;
+	}
+	/*
+	 * At this point the traversal callback is identical to a sorted
+	 * container.
+	 */
+	return CMP_MATCH;
+}
+
+static int topic_statistics_hash(const void *obj, const int flags)
+{
+	const struct stasis_topic_statistics *object;
+	const char *key;
+
+	switch (flags & OBJ_SEARCH_MASK) {
+	case OBJ_SEARCH_KEY:
+		key = obj;
+		break;
+	case OBJ_SEARCH_OBJECT:
+		object = obj;
+		key = object->name;
+		break;
+	default:
+		/* Hash can only work on something with a full key. */
+		ast_assert(0);
+		return 0;
+	}
+	return ast_str_case_hash(key);
+}
+
+static int topic_statistics_cmp(void *obj, void *arg, int flags)
+{
+	const struct stasis_topic_statistics *object_left = obj;
+	const struct stasis_topic_statistics *object_right = arg;
+	const char *right_key = arg;
+	int cmp;
+
+	switch (flags & OBJ_SEARCH_MASK) {
+	case OBJ_SEARCH_OBJECT:
+		right_key = object_right->name;
+		/* Fall through */
+	case OBJ_SEARCH_KEY:
+		cmp = strcasecmp(object_left->name, right_key);
+		break;
+	case OBJ_SEARCH_PARTIAL_KEY:
+		/* Not supported by container */
+		ast_assert(0);
+		cmp = -1;
+		break;
+	default:
+		/*
+		 * What arg points to is specific to this traversal callback
+		 * and has no special meaning to astobj2.
+		 */
+		cmp = 0;
+		break;
+	}
+	if (cmp) {
+		return 0;
+	}
+	/*
+	 * At this point the traversal callback is identical to a sorted
+	 * container.
+	 */
+	return CMP_MATCH;
+}
+#endif
+
 /*! \brief Cleanup function for graceful shutdowns */
 static void stasis_cleanup(void)
 {
+#ifdef AST_DEVMODE
+	ast_cli_unregister_multiple(cli_stasis_statistics, ARRAY_LEN(cli_stasis_statistics));
+	AST_VECTOR_FREE(&message_type_statistics);
+	ao2_cleanup(subscription_statistics);
+	ao2_cleanup(topic_statistics);
+#endif
 	ast_threadpool_shutdown(pool);
 	pool = NULL;
 	STASIS_MESSAGE_TYPE_CLEANUP(stasis_subscription_change_type);
@@ -1661,7 +2720,7 @@ int stasis_init(void)
 	threadpool_opts.auto_increment = 1;
 	threadpool_opts.max_size = cfg->threadpool_options->max_size;
 	threadpool_opts.idle_timeout = cfg->threadpool_options->idle_timeout_sec;
-	pool = ast_threadpool_create("stasis-core", NULL, &threadpool_opts);
+	pool = ast_threadpool_create("stasis", NULL, &threadpool_opts);
 	ao2_ref(cfg, -1);
 	if (!pool) {
 		ast_log(LOG_ERROR, "Failed to create 'stasis-core' threadpool\n");
@@ -1680,6 +2739,29 @@ int stasis_init(void)
 	if (STASIS_MESSAGE_TYPE_INIT(ast_multi_user_event_type) != 0) {
 		return -1;
 	}
+
+#ifdef AST_DEVMODE
+	/* Statistics information is stored separately so that we don't alter or interrupt the lifetime of the underlying
+	 * topic or subscripton.
+	 */
+	subscription_statistics = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, SUBSCRIPTION_STATISTICS_BUCKETS,
+		subscription_statistics_hash, 0, subscription_statistics_cmp);
+	if (!subscription_statistics) {
+		return -1;
+	}
+
+	topic_statistics = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, TOPIC_STATISTICS_BUCKETS,
+		topic_statistics_hash, 0, topic_statistics_cmp);
+	if (!topic_statistics) {
+		return -1;
+	}
+
+	AST_VECTOR_INIT(&message_type_statistics, 0);
+
+	if (ast_cli_register_multiple(cli_stasis_statistics, ARRAY_LEN(cli_stasis_statistics))) {
+		return -1;
+	}
+#endif
 
 	return 0;
 }

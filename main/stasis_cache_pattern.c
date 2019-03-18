@@ -67,13 +67,14 @@ struct stasis_cp_all *stasis_cp_all_create(const char *name,
 {
 	char *cached_name = NULL;
 	struct stasis_cp_all *all;
+	static int cache_id;
 
 	all = ao2_t_alloc(sizeof(*all), all_dtor, name);
 	if (!all) {
 		return NULL;
 	}
 
-	ast_asprintf(&cached_name, "%s-cached", name);
+	ast_asprintf(&cached_name, "cache_pattern:%d/%s", ast_atomic_fetchadd_int(&cache_id, +1), name);
 	if (!cached_name) {
 		ao2_ref(all, -1);
 
@@ -216,4 +217,22 @@ struct stasis_topic *stasis_cp_single_topic_cached(
 		return NULL;
 	}
 	return stasis_caching_get_topic(one->topic_cached);
+}
+
+int stasis_cp_single_accept_message_type(struct stasis_cp_single *one,
+	struct stasis_message_type *type)
+{
+	if (!one) {
+		return -1;
+	}
+	return stasis_caching_accept_message_type(one->topic_cached, type);
+}
+
+int stasis_cp_single_set_filter(struct stasis_cp_single *one,
+	enum stasis_subscription_message_filter filter)
+{
+	if (!one) {
+		return -1;
+	}
+	return stasis_caching_set_filter(one->topic_cached, filter);
 }

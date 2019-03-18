@@ -137,14 +137,31 @@
 		</syntax>
 		<description>
 			<para>Retrieves the numeric status associated with the buddy identified
-			by <replaceable>jid</replaceable>.
-			If the buddy does not exist in the buddylist, returns 7.</para>
-			<para>Status will be 1-7.</para>
-			<para>1=Online, 2=Chatty, 3=Away, 4=XAway, 5=DND, 6=Offline</para>
-			<para>If not in roster variable will be set to 7.</para>
-			<para>Example: ${JABBER_STATUS(asterisk,bob@domain.com)} returns 1 if
-			<replaceable>bob@domain.com</replaceable> is online. <replaceable>asterisk</replaceable> is
-			the associated XMPP account configured in xmpp.conf.</para>
+			by <replaceable>jid</replaceable>. The return value will be one of the
+			following.</para>
+			<enumlist>
+				<enum name="1">
+					<para>Online</para>
+				</enum>
+				<enum name="2">
+					<para>Chatty</para>
+				</enum>
+				<enum name="3">
+					<para>Away</para>
+				</enum>
+				<enum name="4">
+					<para>Extended Away</para>
+				</enum>
+				<enum name="5">
+					<para>Do Not Disturb</para>
+				</enum>
+				<enum name="6">
+					<para>Offline</para>
+				</enum>
+				<enum name="7">
+					<para>Not In Roster</para>
+				</enum>
+			</enumlist>
 		</description>
 		<see-also>
 			<ref type="function" module="res_xmpp">JABBER_RECEIVE</ref>
@@ -211,50 +228,6 @@
 		</syntax>
 		<description>
 			<para>Allows Asterisk to leave a chat room.</para>
-		</description>
-	</application>
-	<application name="JabberStatus" language="en_US" module="res_xmpp">
-		<synopsis>
-			Retrieve the status of a jabber list member
-		</synopsis>
-		<syntax>
-			<parameter name="Jabber" required="true">
-				<para>Client or transport Asterisk users to connect to Jabber.</para>
-			</parameter>
-			<parameter name="JID" required="true">
-				<para>XMPP/Jabber JID (Name) of recipient.</para>
-			</parameter>
-			<parameter name="Variable" required="true">
-				<para>Variable to store the status of requested user.</para>
-			</parameter>
-		</syntax>
-		<description>
-			<para>This application is deprecated. Please use the JABBER_STATUS() function instead.</para>
-			<para>Retrieves the numeric status associated with the specified buddy <replaceable>JID</replaceable>.
-			The return value in the <replaceable>Variable</replaceable>will be one of the following.</para>
-			<enumlist>
-				<enum name="1">
-					<para>Online.</para>
-				</enum>
-				<enum name="2">
-					<para>Chatty.</para>
-				</enum>
-				<enum name="3">
-					<para>Away.</para>
-				</enum>
-				<enum name="4">
-					<para>Extended Away.</para>
-				</enum>
-				<enum name="5">
-					<para>Do Not Disturb.</para>
-				</enum>
-				<enum name="6">
-					<para>Offline.</para>
-				</enum>
-				<enum name="7">
-					<para>Not In Roster.</para>
-				</enum>
-			</enumlist>
 		</description>
 	</application>
 	<manager name="JabberSend" language="en_US" module="res_xmpp">
@@ -641,7 +614,9 @@ static struct ast_xmpp_client *xmpp_client_alloc(const char *name)
 		return NULL;
 	}
 
-	if (!(client->buddies = ao2_container_alloc(BUDDY_BUCKETS, xmpp_buddy_hash, xmpp_buddy_cmp))) {
+	client->buddies = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, BUDDY_BUCKETS,
+		xmpp_buddy_hash, NULL, xmpp_buddy_cmp);
+	if (!client->buddies) {
 		ast_log(LOG_ERROR, "Could not initialize buddy container for '%s'\n", name);
 		ao2_ref(client, -1);
 		return NULL;
@@ -707,7 +682,9 @@ static void *ast_xmpp_client_config_alloc(const char *cat)
 		return NULL;
 	}
 
-	if (!(cfg->buddies = ao2_container_alloc(BUDDY_BUCKETS, xmpp_buddy_hash, xmpp_buddy_cmp))) {
+	cfg->buddies = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, BUDDY_BUCKETS,
+		xmpp_buddy_hash, NULL, xmpp_buddy_cmp);
+	if (!cfg->buddies) {
 		ao2_ref(cfg, -1);
 		return NULL;
 	}
@@ -723,14 +700,6 @@ static void xmpp_config_destructor(void *obj)
 	struct xmpp_config *cfg = obj;
 	ao2_cleanup(cfg->global);
 	ao2_cleanup(cfg->clients);
-}
-
-/*! \brief Hashing function for configuration */
-static int xmpp_config_hash(const void *obj, const int flags)
-{
-	const struct ast_xmpp_client_config *cfg = obj;
-	const char *name = (flags & OBJ_KEY) ? obj : cfg->name;
-	return ast_str_case_hash(name);
 }
 
 /*! \brief Comparator function for configuration */
@@ -754,7 +723,9 @@ static void *xmpp_config_alloc(void)
 		goto error;
 	}
 
-	if (!(cfg->clients = ao2_container_alloc(1, xmpp_config_hash, xmpp_config_cmp))) {
+	cfg->clients = ao2_container_alloc_list(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		NULL, xmpp_config_cmp);
+	if (!cfg->clients) {
 		goto error;
 	}
 
@@ -1626,11 +1597,15 @@ static void xmpp_init_event_distribution(struct ast_xmpp_client *client)
 	if (!(client->mwi_sub = stasis_subscribe_pool(ast_mwi_topic_all(), xmpp_pubsub_mwi_cb, client))) {
 		return;
 	}
+	stasis_subscription_accept_message_type(client->mwi_sub, ast_mwi_state_type());
+	stasis_subscription_set_filter(client->mwi_sub, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 
 	if (!(client->device_state_sub = stasis_subscribe(ast_device_state_topic_all(), xmpp_pubsub_devstate_cb, client))) {
 		client->mwi_sub = stasis_unsubscribe(client->mwi_sub);
 		return;
 	}
+	stasis_subscription_accept_message_type(client->device_state_sub, ast_device_state_message_type());
+	stasis_subscription_set_filter(client->device_state_sub, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 
 	cached = stasis_cache_dump(ast_device_state_cache(), NULL);
 	ao2_callback(cached, OBJ_NODATA, cached_devstate_cb, client);
@@ -1677,64 +1652,6 @@ static int get_buddy_status(struct ast_xmpp_client_config *clientcfg, char *scre
 	ao2_cleanup(buddy);
 
 	return status;
-}
-
-/*
- * \internal
- * \brief Dial plan function status(). puts the status of watched user
- * into a channel variable.
- * \param chan ast_channel
- * \param data
- * \retval 0 success
- * \retval -1 error
- */
-static int xmpp_status_exec(struct ast_channel *chan, const char *data)
-{
-	RAII_VAR(struct xmpp_config *, cfg, ao2_global_obj_ref(globals), ao2_cleanup);
-	RAII_VAR(struct ast_xmpp_client_config *, clientcfg, NULL, ao2_cleanup);
-	char *s = NULL, status[2];
-	static int deprecation_warning = 0;
-	AST_DECLARE_APP_ARGS(args,
-			     AST_APP_ARG(sender);
-			     AST_APP_ARG(jid);
-			     AST_APP_ARG(variable);
-		);
-	AST_DECLARE_APP_ARGS(jid,
-			     AST_APP_ARG(screenname);
-			     AST_APP_ARG(resource);
-		);
-
-	if (deprecation_warning++ % 10 == 0) {
-		ast_log(LOG_WARNING, "JabberStatus is deprecated.  Please use the JABBER_STATUS dialplan function in the future.\n");
-	}
-
-	if (ast_strlen_zero(data)) {
-		ast_log(LOG_ERROR, "Usage: JabberStatus(<sender>,<jid>[/<resource>],<varname>\n");
-		return 0;
-	}
-	s = ast_strdupa(data);
-	AST_STANDARD_APP_ARGS(args, s);
-
-	if (args.argc != 3) {
-		ast_log(LOG_ERROR, "JabberStatus() requires 3 arguments.\n");
-		return -1;
-	}
-
-	AST_NONSTANDARD_APP_ARGS(jid, args.jid, '/');
-	if (jid.argc < 1 || jid.argc > 2) {
-		ast_log(LOG_WARNING, "Wrong JID %s, exiting\n", args.jid);
-		return -1;
-	}
-
-	if (!cfg || !cfg->clients || !(clientcfg = xmpp_config_find(cfg->clients, args.sender))) {
-		ast_log(LOG_WARNING, "Could not find sender connection: '%s'\n", args.sender);
-		return -1;
-	}
-
-	snprintf(status, sizeof(status), "%d", get_buddy_status(clientcfg, jid.screenname, jid.resource));
-	pbx_builtin_setvar_helper(chan, args.variable, status);
-
-	return 0;
 }
 
 /*!
@@ -2250,7 +2167,9 @@ static struct ast_xmpp_buddy *xmpp_client_create_buddy(struct ao2_container *con
 		return NULL;
 	}
 
-	if (!(buddy->resources = ao2_container_alloc(RESOURCE_BUCKETS, xmpp_resource_hash, xmpp_resource_cmp))) {
+	buddy->resources = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		RESOURCE_BUCKETS, xmpp_resource_hash, NULL, xmpp_resource_cmp);
+	if (!buddy->resources) {
 		ao2_ref(buddy, -1);
 		return NULL;
 	}
@@ -4748,7 +4667,6 @@ static int load_module(void)
 
 	ast_register_application_xml(app_ajisend, xmpp_send_exec);
 	ast_register_application_xml(app_ajisendgroup, xmpp_sendgroup_exec);
-	ast_register_application_xml(app_ajistatus, xmpp_status_exec);
 	ast_register_application_xml(app_ajijoin, xmpp_join_exec);
 	ast_register_application_xml(app_ajileave, xmpp_leave_exec);
 

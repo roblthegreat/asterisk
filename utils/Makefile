@@ -172,6 +172,7 @@ threadstorage.c: $(ASTTOPDIR)/main/threadstorage.c
 	$(CMD_PREFIX) cp "$<" "$@"
 
 
+extconf.o: _ASTCFLAGS+=$(call get_menuselect_cflags,DETECT_DEADLOCKS)
 extconf.o: extconf.c
 
 conf2ael: LIBS+=$(AST_CLANG_BLOCKS_LIBS)
@@ -183,7 +184,7 @@ check_expr2: $(ASTTOPDIR)/main/ast_expr2f.c $(ASTTOPDIR)/main/ast_expr2.c $(ASTT
 	$(ECHO_PREFIX) echo "   [CC] ast_expr2.c -> ast_expr2z.o"
 	$(CC) -g -c -I$(ASTTOPDIR)/include -DSTANDALONE2 $(ASTTOPDIR)/main/ast_expr2.c -o ast_expr2z.o
 	$(ECHO_PREFIX) echo "   [LD] ast_expr2fz.o ast_expr2z.o  -> check_expr2"
-	$(CC) -g -o check_expr2 ast_expr2fz.o ast_expr2z.o astmm.o -lm
+	$(CC) -g -o check_expr2 ast_expr2fz.o ast_expr2z.o astmm.o -lm $(_ASTLDFLAGS)
 	$(ECHO_PREFIX) echo "   [RM] ast_expr2fz.o ast_expr2z.o"
 	rm ast_expr2z.o ast_expr2fz.o
 	./check_expr2 expr2.testinput

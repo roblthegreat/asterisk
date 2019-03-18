@@ -1125,12 +1125,13 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
-	nodes = ao2_container_alloc(23, corosync_node_hash_fn, corosync_node_cmp_fn);
+	nodes = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, 23,
+		corosync_node_hash_fn, NULL, corosync_node_cmp_fn);
 	if (!nodes) {
 		goto failed;
 	}
 
-	corosync_aggregate_topic = stasis_topic_create("corosync_aggregate_topic");
+	corosync_aggregate_topic = stasis_topic_create("corosync:aggregator");
 	if (!corosync_aggregate_topic) {
 		ast_log(AST_LOG_ERROR, "Failed to create stasis topic for corosync\n");
 		goto failed;

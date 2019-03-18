@@ -294,9 +294,12 @@ int daemon(int, int);  /* defined in libresolv of all places */
 #define AST_MAX_CONNECTS 128
 #define NUM_MSGS 64
 
+/*! Displayed copyright tag */
+#define COPYRIGHT_TAG "Copyright (C) 1999 - 2018, Digium, Inc. and others."
+
 /*! \brief Welcome message when starting a CLI interface */
 #define WELCOME_MESSAGE \
-    ast_verbose("Asterisk %s, Copyright (C) 1999 - 2018, Digium, Inc. and others.\n" \
+    ast_verbose("Asterisk %s, " COPYRIGHT_TAG "\n" \
                 "Created by Mark Spencer <markster@digium.com>\n" \
                 "Asterisk comes with ABSOLUTELY NO WARRANTY; type 'core show warranty' for details.\n" \
                 "This is free software, with components licensed under the GNU General Public\n" \
@@ -389,6 +392,7 @@ static struct {
 	 unsigned int need_reload:1;
 	 unsigned int need_quit:1;
 	 unsigned int need_quit_handler:1;
+	 unsigned int need_el_end:1;
 } sig_flags;
 
 #if !defined(LOW_MEMORY)
@@ -1672,9 +1676,15 @@ static struct sigaction urg_handler = {
 static void _hup_handler(int num)
 {
 	int save_errno = errno;
-	printf("Received HUP signal -- Reloading configs\n");
-	if (restartnow)
+
+	if (restartnow) {
+		if (el) {
+			el_end(el);
+		}
 		execvp(_argv[0], _argv);
+	}
+
+	printf("Received HUP signal -- Reloading configs\n");
 	sig_flags.need_reload = 1;
 	if (ast_alertpipe_write(sig_alert_pipe)) {
 		fprintf(stderr, "hup_handler: write() failed: %s\n", strerror(errno));
@@ -2015,10 +2025,9 @@ static void really_quit(int num, shutdown_nice_t niceness, int restart)
 			if (el_hist != NULL) {
 				history_end(el_hist);
 			}
-		} else if (mon_sig_flags == pthread_self()) {
-			if (consolethread != AST_PTHREADT_NULL) {
-				pthread_kill(consolethread, SIGURG);
-			}
+		} else if (!restart) {
+			sig_flags.need_el_end = 1;
+			pthread_kill(consolethread, SIGURG);
 		}
 	}
 	active_channels = ast_active_channels();
@@ -2635,7 +2644,7 @@ static int ast_el_read_char(EditLine *editline, CHAR_T_LIBEDIT *cp)
 		}
 		res = ast_poll(fds, max, -1);
 		if (res < 0) {
-			if (sig_flags.need_quit || sig_flags.need_quit_handler) {
+			if (sig_flags.need_quit || sig_flags.need_quit_handler || sig_flags.need_el_end) {
 				break;
 			}
 			if (errno == EINTR) {
@@ -3163,7 +3172,7 @@ static void ast_remotecontrol(char *data)
 		sprintf(tmp, "%s%s", prefix, data);
 		if (write(ast_consock, tmp, strlen(tmp) + 1) < 0) {
 			ast_log(LOG_ERROR, "write() failed: %s\n", strerror(errno));
-			if (sig_flags.need_quit || sig_flags.need_quit_handler) {
+			if (sig_flags.need_quit || sig_flags.need_quit_handler || sig_flags.need_el_end) {
 				return;
 			}
 		}
@@ -3195,7 +3204,7 @@ static void ast_remotecontrol(char *data)
 			char buffer[512] = "", *curline = buffer, *nextline;
 			int not_written = 1;
 
-			if (sig_flags.need_quit || sig_flags.need_quit_handler) {
+			if (sig_flags.need_quit || sig_flags.need_quit_handler || sig_flags.need_el_end) {
 				break;
 			}
 
@@ -3255,7 +3264,7 @@ static void ast_remotecontrol(char *data)
 	for (;;) {
 		ebuf = (char *)el_gets(el, &num);
 
-		if (sig_flags.need_quit || sig_flags.need_quit_handler) {
+		if (sig_flags.need_quit || sig_flags.need_quit_handler || sig_flags.need_el_end) {
 			break;
 		}
 
@@ -3285,7 +3294,7 @@ static int show_version(void)
 
 static int show_cli_help(void)
 {
-	printf("Asterisk %s, Copyright (C) 1999 - 2016, Digium, Inc. and others.\n", ast_get_version());
+	printf("Asterisk %s, " COPYRIGHT_TAG "\n", ast_get_version());
 	printf("Usage: asterisk [OPTIONS]\n");
 	printf("Valid Options:\n");
 	printf("   -V              Display version number and exit\n");
@@ -3961,9 +3970,7 @@ static void asterisk_daemon(int isroot, const char *runuser, const char *rungrou
 	 * an Asterisk instance, and that there isn't one already running. */
 	multi_thread_safe = 1;
 
-#if defined(__AST_DEBUG_MALLOC)
-	__ast_mm_init_phase_1();
-#endif	/* defined(__AST_DEBUG_MALLOC) */
+	load_astmm_phase_1();
 
 	/* Check whether high prio was succesfully set by us or some
 	 * other incantation. */
@@ -4052,7 +4059,7 @@ static void asterisk_daemon(int isroot, const char *runuser, const char *rungrou
 	}
 	ast_verb(0, "PBX UUID: %s\n", pbx_uuid);
 
-	ast_json_init();
+	check_init(ast_json_init(), "libjansson");
 	ast_ulaw_init();
 	ast_alaw_init();
 	tdd_init();
@@ -4063,6 +4070,8 @@ static void asterisk_daemon(int isroot, const char *runuser, const char *rungrou
 	check_init(ast_tps_init(), "Task Processor Core");
 	check_init(ast_fd_init(), "File Descriptor Debugging");
 	check_init(ast_pbx_init(), "ast_pbx_init");
+	check_init(aco_init(), "Configuration Option Framework");
+	check_init(stasis_init(), "Stasis");
 #ifdef TEST_FRAMEWORK
 	check_init(ast_test_init(), "Test Framework");
 #endif
@@ -4075,9 +4084,7 @@ static void asterisk_daemon(int isroot, const char *runuser, const char *rungrou
 	check_init(ast_format_init(), "Formats");
 	check_init(ast_format_cache_init(), "Format Cache");
 	check_init(ast_codec_builtin_init(), "Built-in Codecs");
-	check_init(aco_init(), "Configuration Option Framework");
 	check_init(ast_bucket_init(), "Bucket API");
-	check_init(stasis_init(), "Stasis");
 	check_init(ast_stasis_system_init(), "Stasis system-level information");
 	check_init(ast_endpoint_stasis_init(), "Stasis Endpoint");
 
@@ -4139,10 +4146,7 @@ static void asterisk_daemon(int isroot, const char *runuser, const char *rungrou
 	check_init(ast_local_init(), "Local Proxy Channel Driver");
 
 	/* We should avoid most config loads before this point as they can't use realtime. */
-	check_init(load_modules(1), "Module Preload");
-
-	/* Load remaining modules */
-	check_init(load_modules(0), "Module");
+	check_init(load_modules(), "Module");
 
 	/*
 	 * This has to load after the dynamic modules load, as items in the media
@@ -4171,9 +4175,7 @@ static void asterisk_daemon(int isroot, const char *runuser, const char *rungrou
 
 	pthread_sigmask(SIG_UNBLOCK, &sigs, NULL);
 
-#if defined(__AST_DEBUG_MALLOC)
-	__ast_mm_init_phase_2();
-#endif	/* defined(__AST_DEBUG_MALLOC) */
+	load_astmm_phase_2();
 
 	ast_cli_register_multiple(cli_asterisk_shutdown, ARRAY_LEN(cli_asterisk_shutdown));
 	ast_cli_register_multiple(cli_asterisk, ARRAY_LEN(cli_asterisk));
@@ -4205,6 +4207,12 @@ static void asterisk_daemon(int isroot, const char *runuser, const char *rungrou
 		el_set(el, EL_GETCFN, ast_el_read_char);
 
 		for (;;) {
+			if (sig_flags.need_el_end) {
+				el_end(el);
+
+				return;
+			}
+
 			if (sig_flags.need_quit || sig_flags.need_quit_handler) {
 				quit_handler(0, SHUTDOWN_FAST, 0);
 				break;

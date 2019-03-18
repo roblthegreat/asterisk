@@ -819,12 +819,12 @@ static void announce_to_dial(char *dial_string, char *announce_string, int parki
 	snprintf(buf, sizeof(buf), "%d", parkingspace);
 	oh.vars = ast_variable_new("_PARKEDAT", buf, "");
 
-	inherit_channel_vars_from_id(&oh, parkee_snapshot->uniqueid);
+	inherit_channel_vars_from_id(&oh, parkee_snapshot->base->uniqueid);
 
 	dchan = __ast_request_and_dial(dial_tech, cap_slin, NULL, NULL, dial_string, 30000,
 		&outstate,
-		parkee_snapshot->caller_number,
-		parkee_snapshot->caller_name,
+		parkee_snapshot->caller->number,
+		parkee_snapshot->caller->name,
 		&oh);
 
 	ast_variables_destroy(oh.vars);
@@ -868,12 +868,16 @@ static void park_announce_update_cb(void *data, struct stasis_subscription *sub,
 		return;
 	}
 
+	if (ast_parked_call_type() != stasis_message_type(message)) {
+		return;
+	}
+
 	if (payload->event_type != PARKED_CALL) {
 		/* We are only concerned with calls parked */
 		return;
 	}
 
-	if (strcmp(payload->parkee->uniqueid, pa_data->parkee_uuid)) {
+	if (strcmp(payload->parkee->base->uniqueid, pa_data->parkee_uuid)) {
 		/* We are only concerned with the parkee we are subscribed for. */
 		return;
 	}
@@ -953,6 +957,10 @@ static int park_and_announce_app_exec(struct ast_channel *chan, const char *data
 		park_announce_subscription_data_destroy(pa_data);
 		return -1;
 	}
+
+	stasis_subscription_accept_message_type(parking_subscription, ast_parked_call_type());
+	stasis_subscription_accept_message_type(parking_subscription, stasis_subscription_change_type());
+	stasis_subscription_set_filter(parking_subscription, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 
 	/* Now for the fun part... park it! */
 	ast_bridge_join(parking_bridge, chan, NULL, &chan_features, NULL, 0);

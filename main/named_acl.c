@@ -131,7 +131,9 @@ static void *named_acl_config_alloc(void)
 		return NULL;
 	}
 
-	if (!(cfg->named_acl_list = ao2_container_alloc(37, named_acl_hash_fn, named_acl_cmp_fn))) {
+	cfg->named_acl_list = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, 37,
+		named_acl_hash_fn, NULL, named_acl_cmp_fn);
+	if (!cfg->named_acl_list) {
 		goto error;
 	}
 
@@ -591,4 +593,5 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_
 	.unload = unload_module,
 	.reload = reload_module,
 	.load_pri = AST_MODPRI_CORE,
+	.requires = "extconfig",
 );

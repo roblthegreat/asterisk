@@ -114,8 +114,11 @@ static SQLHSTMT custom_prepare(struct odbc_obj *obj, void *data)
 
 	ast_debug(1, "Skip: %llu; SQL: %s\n", cps->skip, cps->sql);
 
-	res = SQLPrepare(stmt, (unsigned char *)cps->sql, SQL_NTS);
+	res = ast_odbc_prepare(obj, stmt, cps->sql);
 	if ((res != SQL_SUCCESS) && (res != SQL_SUCCESS_WITH_INFO)) {
+		if (res == SQL_ERROR) {
+			ast_odbc_print_errors(SQL_HANDLE_STMT, stmt, "SQL Prepare");
+		}
 		ast_log(LOG_WARNING, "SQL Prepare failed! [%s]\n", cps->sql);
 		SQLFreeHandle (SQL_HANDLE_STMT, stmt);
 		return NULL;
@@ -571,6 +574,7 @@ struct update2_prepare_struct {
 	const char *table;
 	const struct ast_variable *lookup_fields;
 	const struct ast_variable *update_fields;
+	struct odbc_cache_tables *tableptr;
 };
 
 static SQLHSTMT update2_prepare(struct odbc_obj *obj, void *data)
@@ -580,29 +584,21 @@ static SQLHSTMT update2_prepare(struct odbc_obj *obj, void *data)
 	const struct ast_variable *field;
 	struct ast_str *sql = ast_str_thread_get(&sql_buf, SQL_BUF_SIZE);
 	SQLHSTMT stmt;
-	struct odbc_cache_tables *tableptr;
 
 	if (!sql) {
-		return NULL;
-	}
-
-	tableptr = ast_odbc_find_table(ups->database, ups->table);
-	if (!tableptr) {
-		ast_log(LOG_ERROR, "Could not retrieve metadata for table '%s@%s'.  Update will fail!\n", ups->table, ups->database);
 		return NULL;
 	}
 
 	res = SQLAllocHandle(SQL_HANDLE_STMT, obj->con, &stmt);
 	if ((res != SQL_SUCCESS) && (res != SQL_SUCCESS_WITH_INFO)) {
 		ast_log(LOG_WARNING, "SQL Alloc Handle failed!\n");
-		ast_odbc_release_table(tableptr);
 		return NULL;
 	}
 
 	ast_str_set(&sql, 0, "UPDATE %s SET ", ups->table);
 
 	for (field = ups->update_fields; field; field = field->next) {
-		if (ast_odbc_find_column(tableptr, field->name)) {
+		if (ast_odbc_find_column(ups->tableptr, field->name)) {
 			ast_str_append(&sql, 0, "%s%s=? ", first ? "" : ", ", field->name);
 			SQLBindParameter(stmt, x++, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_CHAR, strlen(field->name), 0, (void *)field->value, 0, NULL);
 			first = 0;
@@ -615,9 +611,8 @@ static SQLHSTMT update2_prepare(struct odbc_obj *obj, void *data)
 	first = 1;
 
 	for (field = ups->lookup_fields; field; field = field->next) {
-		if (!ast_odbc_find_column(tableptr, field->name)) {
+		if (!ast_odbc_find_column(ups->tableptr, field->name)) {
 			ast_log(LOG_ERROR, "One or more of the criteria columns '%s' on '%s@%s' for this update does not exist!\n", field->name, ups->table, ups->database);
-			ast_odbc_release_table(tableptr);
 			SQLFreeHandle(SQL_HANDLE_STMT, stmt);
 			return NULL;
 		}
@@ -626,11 +621,11 @@ static SQLHSTMT update2_prepare(struct odbc_obj *obj, void *data)
 		first = 0;
 	}
 
-	/* Done with the table metadata */
-	ast_odbc_release_table(tableptr);
-
-	res = SQLPrepare(stmt, (unsigned char *)ast_str_buffer(sql), SQL_NTS);
+	res = ast_odbc_prepare(obj, stmt, ast_str_buffer(sql));
 	if ((res != SQL_SUCCESS) && (res != SQL_SUCCESS_WITH_INFO)) {
+		if (res == SQL_ERROR) {
+			ast_odbc_print_errors(SQL_HANDLE_STMT, stmt, "SQL Prepare");
+		}
 		ast_log(LOG_WARNING, "SQL Prepare failed! [%s]\n", ast_str_buffer(sql));
 		SQLFreeHandle(SQL_HANDLE_STMT, stmt);
 		return NULL;
@@ -657,19 +652,35 @@ static int update2_odbc(const char *database, const char *table, const struct as
 {
 	struct odbc_obj *obj;
 	SQLHSTMT stmt;
-	struct update2_prepare_struct ups = { .database = database, .table = table, .lookup_fields = lookup_fields, .update_fields = update_fields, };
+	struct update2_prepare_struct ups = {
+		.database = database,
+		.table = table,
+		.lookup_fields = lookup_fields,
+		.update_fields = update_fields,
+	};
 	struct ast_str *sql;
 	int res;
 	SQLLEN rowcount = 0;
 
+	ups.tableptr = ast_odbc_find_table(database, table);
+	if (!ups.tableptr) {
+		ast_log(LOG_ERROR, "Could not retrieve metadata for table '%s@%s'. Update will fail!\n", table, database);
+		return -1;
+	}
+
 	if (!(obj = ast_odbc_request_obj(database, 0))) {
+		ast_odbc_release_table(ups.tableptr);
 		return -1;
 	}
 
 	if (!(stmt = ast_odbc_prepare_and_execute(obj, update2_prepare, &ups))) {
 		ast_odbc_release_obj(obj);
+		ast_odbc_release_table(ups.tableptr);
 		return -1;
 	}
+
+	/* We don't need the table anymore */
+	ast_odbc_release_table(ups.tableptr);
 
 	res = SQLRowCount(stmt, &rowcount);
 	SQLFreeHandle(SQL_HANDLE_STMT, stmt);
@@ -684,7 +695,7 @@ static int update2_odbc(const char *database, const char *table, const struct as
 	}
 
 	if (rowcount >= 0) {
-		return (int)rowcount;
+		return (int) rowcount;
 	}
 
 	return -1;
@@ -864,7 +875,7 @@ static SQLHSTMT length_determination_odbc_prepare(struct odbc_obj *obj, void *da
 		return NULL;
 	}
 
-	res = SQLPrepare(sth, (unsigned char *)q->sql, SQL_NTS);
+	res = ast_odbc_prepare(obj, sth, q->sql);
 	if ((res != SQL_SUCCESS) && (res != SQL_SUCCESS_WITH_INFO)) {
 		ast_verb(4, "Error in PREPARE %d\n", res);
 		SQLFreeHandle(SQL_HANDLE_STMT, sth);
@@ -888,7 +899,7 @@ static SQLHSTMT config_odbc_prepare(struct odbc_obj *obj, void *data)
 		return NULL;
 	}
 
-	res = SQLPrepare(sth, (unsigned char *)q->sql, SQL_NTS);
+	res = ast_odbc_prepare(obj, sth, q->sql);
 	if ((res != SQL_SUCCESS) && (res != SQL_SUCCESS_WITH_INFO)) {
 		ast_verb(4, "Error in PREPARE %d\n", res);
 		SQLFreeHandle(SQL_HANDLE_STMT, sth);

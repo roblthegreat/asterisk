@@ -259,16 +259,21 @@ static struct mwi_stasis_subscription *mwi_stasis_subscription_alloc(const char 
 	/* Safe strcpy */
 	strcpy(mwi_stasis_sub->mailbox, mailbox);
 
-	ast_debug(3, "Creating stasis MWI subscription to mailbox %s for endpoint %s\n",
-		mailbox, mwi_sub->id);
+	ast_debug(3, "Creating stasis MWI subscription to mailbox %s for endpoint %s.  Topic: '%s':%p %d\n",
+		mailbox, mwi_sub->id, stasis_topic_name(topic), topic, (int)ao2_ref(topic, 0));
 	ao2_ref(mwi_sub, +1);
 	mwi_stasis_sub->stasis_sub = stasis_subscribe_pool(topic, mwi_stasis_cb, mwi_sub);
+	ao2_ref(topic, -1);
+
 	if (!mwi_stasis_sub->stasis_sub) {
 		/* Failed to subscribe. */
 		ao2_ref(mwi_stasis_sub, -1);
 		ao2_ref(mwi_sub, -1);
 		mwi_stasis_sub = NULL;
 	}
+	stasis_subscription_accept_message_type(mwi_stasis_sub->stasis_sub, ast_mwi_state_type());
+	stasis_subscription_accept_message_type(mwi_stasis_sub->stasis_sub, stasis_subscription_change_type());
+	stasis_subscription_set_filter(mwi_stasis_sub->stasis_sub, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 	return mwi_stasis_sub;
 }
 
@@ -358,7 +363,8 @@ static struct mwi_subscription *mwi_subscription_alloc(struct ast_sip_endpoint *
 		sub->sip_sub = sip_sub;
 	}
 
-	sub->stasis_subs = ao2_container_alloc(STASIS_BUCKETS, stasis_sub_hash, stasis_sub_cmp);
+	sub->stasis_subs = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		STASIS_BUCKETS, stasis_sub_hash, NULL, stasis_sub_cmp);
 	if (!sub->stasis_subs) {
 		ao2_cleanup(sub);
 		return NULL;
@@ -1364,7 +1370,11 @@ static int load_module(void)
 		if (ast_test_flag(&ast_options, AST_OPT_FLAG_FULLY_BOOTED)) {
 			ast_sip_push_task(NULL, send_initial_notify_all, NULL);
 		} else {
-			stasis_subscribe_pool(ast_manager_get_topic(), mwi_startup_event_cb, NULL);
+			struct stasis_subscription *sub;
+
+			sub = stasis_subscribe_pool(ast_manager_get_topic(), mwi_startup_event_cb, NULL);
+			stasis_subscription_accept_message_type(sub, ast_manager_get_generic_type());
+			stasis_subscription_set_filter(sub, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 		}
 	}
 

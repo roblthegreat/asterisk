@@ -1433,6 +1433,8 @@ static struct generic_monitor_instance_list *create_new_generic_list(struct ast_
 		cc_unref(generic_list, "Failed to subscribe to device state");
 		return NULL;
 	}
+	stasis_subscription_accept_message_type(generic_list->sub, ast_device_state_message_type());
+	stasis_subscription_set_filter(generic_list->sub, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 	generic_list->current_state = ast_device_state(monitor->interface->device_name);
 	ao2_t_link(generic_monitors, generic_list, "linking new generic monitor instance list");
 	return generic_list;
@@ -2804,6 +2806,9 @@ static int cc_generic_agent_start_monitoring(struct ast_cc_agent *agent)
 	if (!(generic_pvt->sub = stasis_subscribe(device_specific_topic, generic_agent_devstate_cb, agent))) {
 		return -1;
 	}
+	stasis_subscription_accept_message_type(generic_pvt->sub, ast_device_state_message_type());
+	stasis_subscription_accept_message_type(generic_pvt->sub, stasis_subscription_change_type());
+	stasis_subscription_set_filter(generic_pvt->sub, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 	cc_ref(agent, "Ref agent for subscription");
 	return 0;
 }
@@ -4649,14 +4654,19 @@ static int load_module(void)
 {
 	int res;
 
-	if (!(cc_core_instances = ao2_t_container_alloc(CC_CORE_INSTANCES_BUCKETS,
-					cc_core_instance_hash_fn, cc_core_instance_cmp_fn,
-					"Create core instance container"))) {
+	cc_core_instances = ao2_t_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		CC_CORE_INSTANCES_BUCKETS,
+		cc_core_instance_hash_fn, NULL, cc_core_instance_cmp_fn,
+		"Create core instance container");
+	if (!cc_core_instances) {
 		return AST_MODULE_LOAD_FAILURE;
 	}
-	if (!(generic_monitors = ao2_t_container_alloc(CC_CORE_INSTANCES_BUCKETS,
-			generic_monitor_instance_list_hash_fn, generic_monitor_instance_list_cmp_fn,
-			"Create generic monitor container"))) {
+
+	generic_monitors = ao2_t_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		CC_CORE_INSTANCES_BUCKETS,
+		generic_monitor_instance_list_hash_fn, NULL, generic_monitor_instance_list_cmp_fn,
+		"Create generic monitor container");
+	if (!generic_monitors) {
 		return AST_MODULE_LOAD_FAILURE;
 	}
 	if (!(cc_core_taskprocessor = ast_taskprocessor_get("CCSS_core", TPS_REF_DEFAULT))) {

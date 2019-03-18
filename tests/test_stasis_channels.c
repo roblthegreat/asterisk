@@ -220,12 +220,12 @@ AST_TEST_DEFINE(multi_channel_blob_snapshots)
 	/* Test for single match */
 	snapshot = ast_multi_channel_blob_get_channel(blob, "Caller");
 	ast_test_validate(test, NULL != snapshot);
-	ast_test_validate(test, 0 == strcmp("TEST/Alice", snapshot->name));
+	ast_test_validate(test, 0 == strcmp("TEST/Alice", snapshot->base->name));
 
 	/* Test for single match, multiple possibilities */
 	snapshot = ast_multi_channel_blob_get_channel(blob, "Peer");
 	ast_test_validate(test, NULL != snapshot);
-	ast_test_validate(test, 0 != strcmp("TEST/Alice", snapshot->name));
+	ast_test_validate(test, 0 != strcmp("TEST/Alice", snapshot->base->name));
 
 	/* Multi-match */
 	matches = ast_multi_channel_blob_get_channels(blob, "Peer");
@@ -327,6 +327,7 @@ static int load_module(void)
 }
 
 AST_MODULE_INFO(ASTERISK_GPL_KEY, 0, "Stasis Channel Testing",
+	.support_level = AST_MODULE_SUPPORT_CORE,
 	.load = load_module,
 	.unload = unload_module
 );

@@ -498,10 +498,11 @@ static int is_video_dest(const struct ast_stream *stream, const char *source_cha
 }
 
 static int append_source_streams(struct ast_stream_topology *dest,
-	const char *channel_name,
+	const char *channel_name, const char *sdp_label,
 	const struct ast_stream_topology *source)
 {
 	int i;
+	const char *stream_identify;
 
 	for (i = 0; i < ast_stream_topology_get_count(source); ++i) {
 		struct ast_stream *stream;
@@ -513,8 +514,13 @@ static int append_source_streams(struct ast_stream_topology *dest,
 			continue;
 		}
 
+		stream_identify = ast_stream_get_metadata(stream, "MSID:LABEL");
+		if (!stream_identify) {
+			stream_identify = ast_stream_get_name(stream);
+		}
+
 		if (ast_asprintf(&stream_clone_name, "%s_%s_%s", SOFTBRIDGE_VIDEO_DEST_PREFIX,
-			channel_name, ast_stream_get_name(stream)) < 0) {
+			channel_name, stream_identify) < 0) {
 			return -1;
 		}
 
@@ -523,6 +529,12 @@ static int append_source_streams(struct ast_stream_topology *dest,
 		if (!stream_clone) {
 			return -1;
 		}
+
+		/* Sends an "a:label" attribute in the SDP for participant event correlation */
+		if (!ast_strlen_zero(sdp_label)) {
+			ast_stream_set_metadata(stream_clone, "SDP:LABEL", sdp_label);
+		}
+
 		if (ast_stream_topology_append_stream(dest, stream_clone) < 0) {
 			ast_stream_free(stream_clone);
 			return -1;
@@ -585,9 +597,11 @@ static int append_all_streams(struct ast_stream_topology *dest,
  * \param joiner The channel that is joining the softmix bridge
  * \param participants The current participants in the softmix bridge
  */
-static void sfu_topologies_on_join(struct ast_bridge_channel *joiner, struct ast_bridge_channels_list *participants)
+static void sfu_topologies_on_join(struct ast_bridge *bridge,
+	struct ast_bridge_channel *joiner)
 {
 	struct ast_stream_topology *joiner_video = NULL;
+	struct ast_bridge_channels_list *participants = &bridge->channels;
 	struct ast_bridge_channel *participant;
 	int res;
 	struct softmix_channel *sc;
@@ -600,7 +614,9 @@ static void sfu_topologies_on_join(struct ast_bridge_channel *joiner, struct ast
 	sc = joiner->tech_pvt;
 
 	ast_channel_lock(joiner->chan);
-	res = append_source_streams(joiner_video, ast_channel_name(joiner->chan), ast_channel_get_stream_topology(joiner->chan));
+	res = append_source_streams(joiner_video, ast_channel_name(joiner->chan),
+		bridge->softmix.send_sdp_label ? ast_channel_uniqueid(joiner->chan) : NULL,
+		ast_channel_get_stream_topology(joiner->chan));
 	sc->topology = ast_stream_topology_clone(ast_channel_get_stream_topology(joiner->chan));
 	ast_channel_unlock(joiner->chan);
 
@@ -614,7 +630,8 @@ static void sfu_topologies_on_join(struct ast_bridge_channel *joiner, struct ast
 		}
 		ast_channel_lock(participant->chan);
 		res = append_source_streams(sc->topology, ast_channel_name(participant->chan),
-				ast_channel_get_stream_topology(participant->chan));
+			bridge->softmix.send_sdp_label ? ast_channel_uniqueid(participant->chan) : NULL,
+			ast_channel_get_stream_topology(participant->chan));
 		ast_channel_unlock(participant->chan);
 		if (res) {
 			goto cleanup;
@@ -704,7 +721,7 @@ static int softmix_bridge_join(struct ast_bridge *bridge, struct ast_bridge_chan
 		bridge_channel, 0, set_binaural, pos_id, is_announcement);
 
 	if (bridge->softmix.video_mode.mode == AST_BRIDGE_VIDEO_MODE_SFU) {
-		sfu_topologies_on_join(bridge_channel, &bridge->channels);
+		sfu_topologies_on_join(bridge, bridge_channel);
 	}
 
 	softmix_poke_thread(softmix_data);
@@ -1063,9 +1080,11 @@ static int remove_all_original_streams(struct ast_stream_topology *dest,
 	return 0;
 }
 
-static void sfu_topologies_on_source_change(struct ast_bridge_channel *source, struct ast_bridge_channels_list *participants)
+static void sfu_topologies_on_source_change(struct ast_bridge *bridge,
+	struct ast_bridge_channel *source)
 {
 	struct ast_stream_topology *source_video = NULL;
+	struct ast_bridge_channels_list *participants = &bridge->channels;
 	struct ast_bridge_channel *participant;
 	int res;
 
@@ -1075,7 +1094,9 @@ static void sfu_topologies_on_source_change(struct ast_bridge_channel *source, s
 	}
 
 	ast_channel_lock(source->chan);
-	res = append_source_streams(source_video, ast_channel_name(source->chan), ast_channel_get_stream_topology(source->chan));
+	res = append_source_streams(source_video, ast_channel_name(source->chan),
+		bridge->softmix.send_sdp_label ? ast_channel_uniqueid(source->chan) : NULL,
+		ast_channel_get_stream_topology(source->chan));
 	ast_channel_unlock(source->chan);
 	if (res) {
 		goto cleanup;
@@ -1198,7 +1219,7 @@ static int softmix_bridge_write_control(struct ast_bridge *bridge, struct ast_br
 		break;
 	case AST_CONTROL_STREAM_TOPOLOGY_SOURCE_CHANGED:
 		if (bridge->softmix.video_mode.mode == AST_BRIDGE_VIDEO_MODE_SFU) {
-			sfu_topologies_on_source_change(bridge_channel, &bridge->channels);
+			sfu_topologies_on_source_change(bridge, bridge_channel);
 		}
 		break;
 	default:
@@ -2085,7 +2106,9 @@ static void remb_enable_collection(struct ast_bridge *bridge, struct ast_bridge_
 		}
 	}
 
-	if (AST_VECTOR_REPLACE(&softmix_data->remb_collectors, bridge_stream_position, ao2_bump(sc->remb_collector))) {
+	ao2_ref(sc->remb_collector, +1);
+	if (AST_VECTOR_REPLACE(&softmix_data->remb_collectors, bridge_stream_position,
+		sc->remb_collector)) {
 		ao2_ref(sc->remb_collector, -1);
 	}
 }
@@ -2169,6 +2192,7 @@ static void softmix_bridge_stream_topology_changed(struct ast_bridge *bridge, st
 
 		for (i = 0; i < ast_stream_topology_get_count(topology); ++i) {
 			struct ast_stream *stream = ast_stream_topology_get_stream(topology, i);
+			const char *stream_identify;
 
 			if (is_video_source(stream)) {
 				AST_VECTOR_APPEND(&media_types, AST_MEDIA_TYPE_VIDEO);
@@ -2185,7 +2209,12 @@ static void softmix_bridge_stream_topology_changed(struct ast_bridge *bridge, st
 				 */
 				ast_channel_unlock(participant->chan);
 				ast_bridge_channel_unlock(participant);
-				map_source_to_destinations(ast_stream_get_name(stream), ast_channel_name(participant->chan),
+
+				stream_identify = ast_stream_get_metadata(stream, "MSID:LABEL");
+				if (!stream_identify) {
+					stream_identify = ast_stream_get_name(stream);
+				}
+				map_source_to_destinations(stream_identify, ast_channel_name(participant->chan),
 					AST_VECTOR_SIZE(&media_types) - 1, &bridge->channels);
 				ast_bridge_channel_lock(participant);
 				ast_channel_lock(participant->chan);
@@ -2218,6 +2247,8 @@ static void softmix_bridge_stream_topology_changed(struct ast_bridge *bridge, st
 		ast_channel_unlock(participant->chan);
 		ast_bridge_channel_unlock(participant);
 	}
+
+	AST_VECTOR_FREE(&media_types);
 }
 
 static struct ast_bridge_technology softmix_bridge = {
@@ -2379,7 +2410,7 @@ AST_TEST_DEFINE(sfu_append_source_streams)
 		goto end;
 	}
 
-	if (append_source_streams(topology_alice, "PJSIP/Bob-00000001", topology_bob)) {
+	if (append_source_streams(topology_alice, "PJSIP/Bob-00000001", NULL, topology_bob)) {
 		ast_test_status_update(test, "Failed to append Bob's streams to Alice\n");
 		goto end;
 	}
@@ -2398,7 +2429,7 @@ AST_TEST_DEFINE(sfu_append_source_streams)
 		goto end;
 	}
 
-	if (append_source_streams(topology_bob, "PJSIP/Alice-00000000", topology_alice)) {
+	if (append_source_streams(topology_bob, "PJSIP/Alice-00000000", NULL, topology_alice)) {
 		ast_test_status_update(test, "Failed to append Alice's streams to Bob\n");
 		goto end;
 	}

@@ -91,6 +91,76 @@ ari_validator ast_ari_validate_asterisk_info_fn(void)
 	return ast_ari_validate_asterisk_info;
 }
 
+int ast_ari_validate_asterisk_ping(struct ast_json *json)
+{
+	int res = 1;
+	struct ast_json_iter *iter;
+	int has_asterisk_id = 0;
+	int has_ping = 0;
+	int has_timestamp = 0;
+
+	for (iter = ast_json_object_iter(json); iter; iter = ast_json_object_iter_next(json, iter)) {
+		if (strcmp("asterisk_id", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			has_asterisk_id = 1;
+			prop_is_valid = ast_ari_validate_string(
+				ast_json_object_iter_value(iter));
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI AsteriskPing field asterisk_id failed validation\n");
+				res = 0;
+			}
+		} else
+		if (strcmp("ping", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			has_ping = 1;
+			prop_is_valid = ast_ari_validate_string(
+				ast_json_object_iter_value(iter));
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI AsteriskPing field ping failed validation\n");
+				res = 0;
+			}
+		} else
+		if (strcmp("timestamp", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			has_timestamp = 1;
+			prop_is_valid = ast_ari_validate_string(
+				ast_json_object_iter_value(iter));
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI AsteriskPing field timestamp failed validation\n");
+				res = 0;
+			}
+		} else
+		{
+			ast_log(LOG_ERROR,
+				"ARI AsteriskPing has undocumented field %s\n",
+				ast_json_object_iter_key(iter));
+			res = 0;
+		}
+	}
+
+	if (!has_asterisk_id) {
+		ast_log(LOG_ERROR, "ARI AsteriskPing missing required field asterisk_id\n");
+		res = 0;
+	}
+
+	if (!has_ping) {
+		ast_log(LOG_ERROR, "ARI AsteriskPing missing required field ping\n");
+		res = 0;
+	}
+
+	if (!has_timestamp) {
+		ast_log(LOG_ERROR, "ARI AsteriskPing missing required field timestamp\n");
+		res = 0;
+	}
+
+	return res;
+}
+
+ari_validator ast_ari_validate_asterisk_ping_fn(void)
+{
+	return ast_ari_validate_asterisk_ping;
+}
+
 int ast_ari_validate_build_info(struct ast_json *json)
 {
 	int res = 1;
@@ -1290,6 +1360,7 @@ int ast_ari_validate_bridge(struct ast_json *json)
 	int has_bridge_class = 0;
 	int has_bridge_type = 0;
 	int has_channels = 0;
+	int has_creationtime = 0;
 	int has_creator = 0;
 	int has_id = 0;
 	int has_name = 0;
@@ -1324,6 +1395,16 @@ int ast_ari_validate_bridge(struct ast_json *json)
 				ast_ari_validate_string);
 			if (!prop_is_valid) {
 				ast_log(LOG_ERROR, "ARI Bridge field channels failed validation\n");
+				res = 0;
+			}
+		} else
+		if (strcmp("creationtime", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			has_creationtime = 1;
+			prop_is_valid = ast_ari_validate_date(
+				ast_json_object_iter_value(iter));
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI Bridge field creationtime failed validation\n");
 				res = 0;
 			}
 		} else
@@ -1405,6 +1486,11 @@ int ast_ari_validate_bridge(struct ast_json *json)
 
 	if (!has_channels) {
 		ast_log(LOG_ERROR, "ARI Bridge missing required field channels\n");
+		res = 0;
+	}
+
+	if (!has_creationtime) {
+		ast_log(LOG_ERROR, "ARI Bridge missing required field creationtime\n");
 		res = 0;
 	}
 
@@ -1956,6 +2042,127 @@ int ast_ari_validate_mailbox(struct ast_json *json)
 ari_validator ast_ari_validate_mailbox_fn(void)
 {
 	return ast_ari_validate_mailbox;
+}
+
+int ast_ari_validate_application_move_failed(struct ast_json *json)
+{
+	int res = 1;
+	struct ast_json_iter *iter;
+	int has_type = 0;
+	int has_application = 0;
+	int has_args = 0;
+	int has_channel = 0;
+	int has_destination = 0;
+
+	for (iter = ast_json_object_iter(json); iter; iter = ast_json_object_iter_next(json, iter)) {
+		if (strcmp("asterisk_id", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			prop_is_valid = ast_ari_validate_string(
+				ast_json_object_iter_value(iter));
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI ApplicationMoveFailed field asterisk_id failed validation\n");
+				res = 0;
+			}
+		} else
+		if (strcmp("type", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			has_type = 1;
+			prop_is_valid = ast_ari_validate_string(
+				ast_json_object_iter_value(iter));
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI ApplicationMoveFailed field type failed validation\n");
+				res = 0;
+			}
+		} else
+		if (strcmp("application", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			has_application = 1;
+			prop_is_valid = ast_ari_validate_string(
+				ast_json_object_iter_value(iter));
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI ApplicationMoveFailed field application failed validation\n");
+				res = 0;
+			}
+		} else
+		if (strcmp("timestamp", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			prop_is_valid = ast_ari_validate_date(
+				ast_json_object_iter_value(iter));
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI ApplicationMoveFailed field timestamp failed validation\n");
+				res = 0;
+			}
+		} else
+		if (strcmp("args", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			has_args = 1;
+			prop_is_valid = ast_ari_validate_list(
+				ast_json_object_iter_value(iter),
+				ast_ari_validate_string);
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI ApplicationMoveFailed field args failed validation\n");
+				res = 0;
+			}
+		} else
+		if (strcmp("channel", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			has_channel = 1;
+			prop_is_valid = ast_ari_validate_channel(
+				ast_json_object_iter_value(iter));
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI ApplicationMoveFailed field channel failed validation\n");
+				res = 0;
+			}
+		} else
+		if (strcmp("destination", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			has_destination = 1;
+			prop_is_valid = ast_ari_validate_string(
+				ast_json_object_iter_value(iter));
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI ApplicationMoveFailed field destination failed validation\n");
+				res = 0;
+			}
+		} else
+		{
+			ast_log(LOG_ERROR,
+				"ARI ApplicationMoveFailed has undocumented field %s\n",
+				ast_json_object_iter_key(iter));
+			res = 0;
+		}
+	}
+
+	if (!has_type) {
+		ast_log(LOG_ERROR, "ARI ApplicationMoveFailed missing required field type\n");
+		res = 0;
+	}
+
+	if (!has_application) {
+		ast_log(LOG_ERROR, "ARI ApplicationMoveFailed missing required field application\n");
+		res = 0;
+	}
+
+	if (!has_args) {
+		ast_log(LOG_ERROR, "ARI ApplicationMoveFailed missing required field args\n");
+		res = 0;
+	}
+
+	if (!has_channel) {
+		ast_log(LOG_ERROR, "ARI ApplicationMoveFailed missing required field channel\n");
+		res = 0;
+	}
+
+	if (!has_destination) {
+		ast_log(LOG_ERROR, "ARI ApplicationMoveFailed missing required field destination\n");
+		res = 0;
+	}
+
+	return res;
+}
+
+ari_validator ast_ari_validate_application_move_failed_fn(void)
+{
+	return ast_ari_validate_application_move_failed;
 }
 
 int ast_ari_validate_application_replaced(struct ast_json *json)
@@ -5025,6 +5232,9 @@ int ast_ari_validate_event(struct ast_json *json)
 	if (strcmp("Event", discriminator) == 0) {
 		/* Self type; fall through */
 	} else
+	if (strcmp("ApplicationMoveFailed", discriminator) == 0) {
+		return ast_ari_validate_application_move_failed(json);
+	} else
 	if (strcmp("ApplicationReplaced", discriminator) == 0) {
 		return ast_ari_validate_application_replaced(json);
 	} else
@@ -5222,6 +5432,9 @@ int ast_ari_validate_message(struct ast_json *json)
 
 	if (strcmp("Message", discriminator) == 0) {
 		/* Self type; fall through */
+	} else
+	if (strcmp("ApplicationMoveFailed", discriminator) == 0) {
+		return ast_ari_validate_application_move_failed(json);
 	} else
 	if (strcmp("ApplicationReplaced", discriminator) == 0) {
 		return ast_ari_validate_application_replaced(json);
@@ -6464,6 +6677,8 @@ int ast_ari_validate_application(struct ast_json *json)
 	int has_channel_ids = 0;
 	int has_device_names = 0;
 	int has_endpoint_ids = 0;
+	int has_events_allowed = 0;
+	int has_events_disallowed = 0;
 	int has_name = 0;
 
 	for (iter = ast_json_object_iter(json); iter; iter = ast_json_object_iter_next(json, iter)) {
@@ -6511,6 +6726,28 @@ int ast_ari_validate_application(struct ast_json *json)
 				res = 0;
 			}
 		} else
+		if (strcmp("events_allowed", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			has_events_allowed = 1;
+			prop_is_valid = ast_ari_validate_list(
+				ast_json_object_iter_value(iter),
+				ast_ari_validate_object);
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI Application field events_allowed failed validation\n");
+				res = 0;
+			}
+		} else
+		if (strcmp("events_disallowed", ast_json_object_iter_key(iter)) == 0) {
+			int prop_is_valid;
+			has_events_disallowed = 1;
+			prop_is_valid = ast_ari_validate_list(
+				ast_json_object_iter_value(iter),
+				ast_ari_validate_object);
+			if (!prop_is_valid) {
+				ast_log(LOG_ERROR, "ARI Application field events_disallowed failed validation\n");
+				res = 0;
+			}
+		} else
 		if (strcmp("name", ast_json_object_iter_key(iter)) == 0) {
 			int prop_is_valid;
 			has_name = 1;
@@ -6546,6 +6783,16 @@ int ast_ari_validate_application(struct ast_json *json)
 
 	if (!has_endpoint_ids) {
 		ast_log(LOG_ERROR, "ARI Application missing required field endpoint_ids\n");
+		res = 0;
+	}
+
+	if (!has_events_allowed) {
+		ast_log(LOG_ERROR, "ARI Application missing required field events_allowed\n");
+		res = 0;
+	}
+
+	if (!has_events_disallowed) {
+		ast_log(LOG_ERROR, "ARI Application missing required field events_disallowed\n");
 		res = 0;
 	}
 

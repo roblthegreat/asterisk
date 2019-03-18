@@ -42,7 +42,6 @@
 #include "asterisk/channel_internal.h"
 #include "asterisk/endpoints.h"
 #include "asterisk/indications.h"
-#include "asterisk/stasis_cache_pattern.h"
 #include "asterisk/stasis_channels.h"
 #include "asterisk/stasis_endpoints.h"
 #include "asterisk/stringfields.h"
@@ -165,6 +164,7 @@ struct ast_channel {
 	unsigned long insmpl;				/*!< Track the read/written samples for monitor use */
 	unsigned long outsmpl;				/*!< Track the read/written samples for monitor use */
 
+	int blocker_tid;					/*!< If anyone is blocking, this is their thread id */
 	AST_VECTOR(, int) fds;				/*!< File descriptors for channel -- Drivers will poll on
 							 *   these file descriptors, so at least one must be non -1.
 							 *   See \arg \ref AstFileDesc */
@@ -214,12 +214,14 @@ struct ast_channel {
 	char dtmf_digit_to_emulate;			/*!< Digit being emulated */
 	char sending_dtmf_digit;			/*!< Digit this channel is currently sending out. (zero if not sending) */
 	struct timeval sending_dtmf_tv;		/*!< The time this channel started sending the current digit. (Invalid if sending_dtmf_digit is zero.) */
-	struct stasis_cp_single *topics;		/*!< Topic for all channel's events */
+	struct stasis_topic *topic;		/*!< Topic for trhis channel */
+	struct stasis_forward *channel_forward; /*!< Subscription for event forwarding to all channel topic */
 	struct stasis_forward *endpoint_forward;	/*!< Subscription for event forwarding to endpoint's topic */
-	struct stasis_forward *endpoint_cache_forward; /*!< Subscription for cache updates to endpoint's topic */
 	struct ast_stream_topology *stream_topology; /*!< Stream topology */
 	void *stream_topology_change_source; /*!< Source that initiated a stream topology change */
 	struct ast_stream *default_streams[AST_MEDIA_TYPE_END]; /*!< Default streams indexed by media type */
+	struct ast_channel_snapshot *snapshot; /*!< The current up to date snapshot of the channel */
+	struct ast_flags snapshot_segment_flags; /*!< Flags regarding the segments of the snapshot */
 };
 
 /*! \brief The monotonically increasing integer counter for channel uniqueids */
@@ -227,18 +229,40 @@ static int uniqueint;
 
 /* ACCESSORS */
 
-#define DEFINE_STRINGFIELD_SETTERS_FOR(field, publish, assert_on_null) \
+#define DEFINE_STRINGFIELD_SETTERS_FOR(field, assert_on_null) \
 void ast_channel_##field##_set(struct ast_channel *chan, const char *value) \
 { \
 	if ((assert_on_null)) ast_assert(!ast_strlen_zero(value)); \
 	if (!strcmp(value, chan->field)) return; \
 	ast_string_field_set(chan, field, value); \
+} \
+  \
+void ast_channel_##field##_build_va(struct ast_channel *chan, const char *fmt, va_list ap) \
+{ \
+	ast_string_field_build_va(chan, field, fmt, ap); \
+} \
+void ast_channel_##field##_build(struct ast_channel *chan, const char *fmt, ...) \
+{ \
+	va_list ap; \
+	va_start(ap, fmt); \
+	ast_channel_##field##_build_va(chan, fmt, ap); \
+	va_end(ap); \
+}
+
+#define DEFINE_STRINGFIELD_SETTERS_AND_INVALIDATE_FOR(field, publish, assert_on_null, invalidate) \
+void ast_channel_##field##_set(struct ast_channel *chan, const char *value) \
+{ \
+	if ((assert_on_null)) ast_assert(!ast_strlen_zero(value)); \
+	if (!strcmp(value, chan->field)) return; \
+	ast_string_field_set(chan, field, value); \
+	ast_channel_snapshot_invalidate_segment(chan, invalidate); \
 	if (publish && ast_channel_internal_is_finalized(chan)) ast_channel_publish_snapshot(chan); \
 } \
   \
 void ast_channel_##field##_build_va(struct ast_channel *chan, const char *fmt, va_list ap) \
 { \
 	ast_string_field_build_va(chan, field, fmt, ap); \
+	ast_channel_snapshot_invalidate_segment(chan, invalidate); \
 	if (publish && ast_channel_internal_is_finalized(chan)) ast_channel_publish_snapshot(chan); \
 } \
 void ast_channel_##field##_build(struct ast_channel *chan, const char *fmt, ...) \
@@ -249,17 +273,17 @@ void ast_channel_##field##_build(struct ast_channel *chan, const char *fmt, ...)
 	va_end(ap); \
 }
 
-DEFINE_STRINGFIELD_SETTERS_FOR(name, 0, 1);
-DEFINE_STRINGFIELD_SETTERS_FOR(language, 1, 0);
-DEFINE_STRINGFIELD_SETTERS_FOR(musicclass, 0, 0);
-DEFINE_STRINGFIELD_SETTERS_FOR(latest_musicclass, 0, 0);
-DEFINE_STRINGFIELD_SETTERS_FOR(accountcode, 1, 0);
-DEFINE_STRINGFIELD_SETTERS_FOR(peeraccount, 1, 0);
-DEFINE_STRINGFIELD_SETTERS_FOR(userfield, 0, 0);
-DEFINE_STRINGFIELD_SETTERS_FOR(call_forward, 0, 0);
-DEFINE_STRINGFIELD_SETTERS_FOR(parkinglot, 0, 0);
-DEFINE_STRINGFIELD_SETTERS_FOR(hangupsource, 0, 0);
-DEFINE_STRINGFIELD_SETTERS_FOR(dialcontext, 0, 0);
+DEFINE_STRINGFIELD_SETTERS_AND_INVALIDATE_FOR(name, 0, 1, AST_CHANNEL_SNAPSHOT_INVALIDATE_BASE);
+DEFINE_STRINGFIELD_SETTERS_AND_INVALIDATE_FOR(language, 1, 0, AST_CHANNEL_SNAPSHOT_INVALIDATE_BASE);
+DEFINE_STRINGFIELD_SETTERS_FOR(musicclass, 0);
+DEFINE_STRINGFIELD_SETTERS_FOR(latest_musicclass, 0);
+DEFINE_STRINGFIELD_SETTERS_AND_INVALIDATE_FOR(accountcode, 1, 0, AST_CHANNEL_SNAPSHOT_INVALIDATE_BASE);
+DEFINE_STRINGFIELD_SETTERS_AND_INVALIDATE_FOR(peeraccount, 1, 0, AST_CHANNEL_SNAPSHOT_INVALIDATE_PEER);
+DEFINE_STRINGFIELD_SETTERS_AND_INVALIDATE_FOR(userfield, 0, 0, AST_CHANNEL_SNAPSHOT_INVALIDATE_BASE);
+DEFINE_STRINGFIELD_SETTERS_FOR(call_forward, 0);
+DEFINE_STRINGFIELD_SETTERS_FOR(parkinglot, 0);
+DEFINE_STRINGFIELD_SETTERS_AND_INVALIDATE_FOR(hangupsource, 0, 0, AST_CHANNEL_SNAPSHOT_INVALIDATE_HANGUP);
+DEFINE_STRINGFIELD_SETTERS_FOR(dialcontext, 0);
 
 #define DEFINE_STRINGFIELD_GETTER_FOR(field) const char *ast_channel_##field(const struct ast_channel *chan) \
 { \
@@ -297,6 +321,7 @@ const char *ast_channel_appl(const struct ast_channel *chan)
 void ast_channel_appl_set(struct ast_channel *chan, const char *value)
 {
 	chan->appl = value;
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_DIALPLAN);
 }
 const char *ast_channel_blockproc(const struct ast_channel *chan)
 {
@@ -313,6 +338,7 @@ const char *ast_channel_data(const struct ast_channel *chan)
 void ast_channel_data_set(struct ast_channel *chan, const char *value)
 {
 	chan->data = value;
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_DIALPLAN);
 }
 
 const char *ast_channel_context(const struct ast_channel *chan)
@@ -322,6 +348,7 @@ const char *ast_channel_context(const struct ast_channel *chan)
 void ast_channel_context_set(struct ast_channel *chan, const char *value)
 {
 	ast_copy_string(chan->context, value, sizeof(chan->context));
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_DIALPLAN);
 }
 const char *ast_channel_exten(const struct ast_channel *chan)
 {
@@ -330,6 +357,7 @@ const char *ast_channel_exten(const struct ast_channel *chan)
 void ast_channel_exten_set(struct ast_channel *chan, const char *value)
 {
 	ast_copy_string(chan->exten, value, sizeof(chan->exten));
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_DIALPLAN);
 }
 const char *ast_channel_macrocontext(const struct ast_channel *chan)
 {
@@ -403,6 +431,7 @@ int ast_channel_hangupcause(const struct ast_channel *chan)
 void ast_channel_hangupcause_set(struct ast_channel *chan, int value)
 {
 	chan->hangupcause = value;
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_HANGUP);
 }
 int ast_channel_macropriority(const struct ast_channel *chan)
 {
@@ -419,6 +448,7 @@ int ast_channel_priority(const struct ast_channel *chan)
 void ast_channel_priority_set(struct ast_channel *chan, int value)
 {
 	chan->priority = value;
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_DIALPLAN);
 }
 int ast_channel_rings(const struct ast_channel *chan)
 {
@@ -908,18 +938,22 @@ void ast_channel_jb_set(struct ast_channel *chan, struct ast_jb *value)
 void ast_channel_caller_set(struct ast_channel *chan, struct ast_party_caller *value)
 {
 	chan->caller = *value;
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_CALLER);
 }
 void ast_channel_connected_set(struct ast_channel *chan, struct ast_party_connected_line *value)
 {
 	chan->connected = *value;
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_CONNECTED);
 }
 void ast_channel_dialed_set(struct ast_channel *chan, struct ast_party_dialed *value)
 {
 	chan->dialed = *value;
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_CALLER);
 }
 void ast_channel_redirecting_set(struct ast_channel *chan, struct ast_party_redirecting *value)
 {
 	chan->redirecting = *value;
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_CALLER);
 }
 void ast_channel_dtmf_tv_set(struct ast_channel *chan, struct timeval *value)
 {
@@ -940,6 +974,7 @@ struct timeval ast_channel_creationtime(struct ast_channel *chan)
 void ast_channel_creationtime_set(struct ast_channel *chan, struct timeval *value)
 {
 	chan->creationtime = *value;
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_BASE);
 }
 
 struct timeval ast_channel_answertime(struct ast_channel *chan)
@@ -1178,6 +1213,15 @@ void ast_channel_blocker_set(struct ast_channel *chan, pthread_t value)
 	chan->blocker = value;
 }
 
+int ast_channel_blocker_tid(const struct ast_channel *chan)
+{
+	return chan->blocker_tid;
+}
+void ast_channel_blocker_tid_set(struct ast_channel *chan, int value)
+{
+	chan->blocker_tid = value;
+}
+
 ast_timing_func_t ast_channel_timingfunc(const struct ast_channel *chan)
 {
 	return chan->timingfunc;
@@ -1194,6 +1238,7 @@ struct ast_bridge *ast_channel_internal_bridge(const struct ast_channel *chan)
 void ast_channel_internal_bridge_set(struct ast_channel *chan, struct ast_bridge *value)
 {
 	chan->bridge = value;
+	ast_channel_snapshot_invalidate_segment(chan, AST_CHANNEL_SNAPSHOT_INVALIDATE_BRIDGE);
 	ast_channel_publish_snapshot(chan);
 }
 
@@ -1292,7 +1337,9 @@ struct ast_channel *__ast_channel_internal_alloc(void (*destructor)(void *obj), 
 		return ast_channel_unref(tmp);
 	}
 
-	if (!(tmp->dialed_causes = ao2_container_alloc(DIALED_CAUSES_BUCKETS, pvt_cause_hash_fn, pvt_cause_cmp_fn))) {
+	tmp->dialed_causes = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		DIALED_CAUSES_BUCKETS, pvt_cause_hash_fn, NULL, pvt_cause_cmp_fn);
+	if (!tmp->dialed_causes) {
 		return ast_channel_unref(tmp);
 	}
 
@@ -1323,6 +1370,11 @@ struct ast_channel *__ast_channel_internal_alloc(void (*destructor)(void *obj), 
 
 	AST_VECTOR_INIT(&tmp->fds, AST_MAX_FDS);
 
+	/* Force all channel snapshot segments to be created on first use, so we don't have to check if
+	 * an old snapshot exists.
+	 */
+	ast_set_flag(&tmp->snapshot_segment_flags, AST_FLAGS_ALL);
+
 	return tmp;
 }
 
@@ -1351,12 +1403,17 @@ void ast_channel_internal_copy_linkedid(struct ast_channel *dest, struct ast_cha
 		return;
 	}
 	dest->linkedid = source->linkedid;
+	ast_channel_snapshot_invalidate_segment(dest, AST_CHANNEL_SNAPSHOT_INVALIDATE_PEER);
 	ast_channel_publish_snapshot(dest);
 }
 
 void ast_channel_internal_swap_uniqueid_and_linkedid(struct ast_channel *a, struct ast_channel *b)
 {
 	struct ast_channel_id temp;
+
+	/* This operation is used as part of masquerading and so does not invalidate the peer
+	 * segment. This is due to the masquerade process invalidating all segments.
+	 */
 
 	temp = a->uniqueid;
 	a->uniqueid = b->uniqueid;
@@ -1369,11 +1426,34 @@ void ast_channel_internal_swap_uniqueid_and_linkedid(struct ast_channel *a, stru
 
 void ast_channel_internal_swap_topics(struct ast_channel *a, struct ast_channel *b)
 {
-	struct stasis_cp_single *temp;
+	struct stasis_topic *topic;
+	struct stasis_forward *forward;
 
-	temp = a->topics;
-	a->topics = b->topics;
-	b->topics = temp;
+	topic = a->topic;
+	a->topic = b->topic;
+	b->topic = topic;
+
+	forward = a->channel_forward;
+	a->channel_forward = b->channel_forward;
+	b->channel_forward = forward;
+}
+
+void ast_channel_internal_swap_endpoint_forward(struct ast_channel *a, struct ast_channel *b)
+{
+	struct stasis_forward *temp;
+
+	temp = a->endpoint_forward;
+	a->endpoint_forward = b->endpoint_forward;
+	b->endpoint_forward = temp;
+}
+
+void ast_channel_internal_swap_snapshots(struct ast_channel *a, struct ast_channel *b)
+{
+	struct ast_channel_snapshot *snapshot;
+
+	snapshot = a->snapshot;
+	a->snapshot = b->snapshot;
+	b->snapshot = snapshot;
 }
 
 void ast_channel_internal_set_fake_ids(struct ast_channel *chan, const char *uniqueid, const char *linkedid)
@@ -1392,11 +1472,11 @@ void ast_channel_internal_cleanup(struct ast_channel *chan)
 
 	ast_string_field_free_memory(chan);
 
+	chan->channel_forward = stasis_forward_cancel(chan->channel_forward);
 	chan->endpoint_forward = stasis_forward_cancel(chan->endpoint_forward);
-	chan->endpoint_cache_forward = stasis_forward_cancel(chan->endpoint_cache_forward);
 
-	stasis_cp_single_unsubscribe(chan->topics);
-	chan->topics = NULL;
+	ao2_cleanup(chan->topic);
+	chan->topic = NULL;
 
 	ast_channel_internal_set_stream_topology(chan, NULL);
 
@@ -1419,16 +1499,7 @@ struct stasis_topic *ast_channel_topic(struct ast_channel *chan)
 		return ast_channel_topic_all();
 	}
 
-	return stasis_cp_single_topic(chan->topics);
-}
-
-struct stasis_topic *ast_channel_topic_cached(struct ast_channel *chan)
-{
-	if (!chan) {
-		return ast_channel_topic_all_cached();
-	}
-
-	return stasis_cp_single_topic_cached(chan->topics);
+	return chan->topic;
 }
 
 int ast_channel_forward_endpoint(struct ast_channel *chan,
@@ -1444,28 +1515,37 @@ int ast_channel_forward_endpoint(struct ast_channel *chan,
 		return -1;
 	}
 
-	chan->endpoint_cache_forward = stasis_forward_all(ast_channel_topic_cached(chan),
-		ast_endpoint_topic(endpoint));
-	if (!chan->endpoint_cache_forward) {
-		chan->endpoint_forward = stasis_forward_cancel(chan->endpoint_forward);
-		return -1;
-	}
-
 	return 0;
 }
 
 int ast_channel_internal_setup_topics(struct ast_channel *chan)
 {
-	const char *topic_name = chan->uniqueid.unique_id;
-	ast_assert(chan->topics == NULL);
+	char *topic_name;
+	int ret;
+	ast_assert(chan->topic == NULL);
 
-	if (ast_strlen_zero(topic_name)) {
-		topic_name = "<dummy-channel>";
+	if (ast_strlen_zero(chan->uniqueid.unique_id)) {
+		static int dummy_id;
+		ret = ast_asprintf(&topic_name, "channel:dummy-%d", ast_atomic_fetchadd_int(&dummy_id, +1));
+	} else {
+		ret = ast_asprintf(&topic_name, "channel:%s", chan->uniqueid.unique_id);
 	}
 
-	chan->topics = stasis_cp_single_create(
-		ast_channel_cache_all(), topic_name);
-	if (!chan->topics) {
+	if (ret < 0) {
+		return -1;
+	}
+
+	chan->topic = stasis_topic_create(topic_name);
+	ast_free(topic_name);
+	if (!chan->topic) {
+		return -1;
+	}
+
+	chan->channel_forward = stasis_forward_all(ast_channel_topic(chan),
+		ast_channel_topic_all());
+	if (!chan->channel_forward) {
+		ao2_ref(chan->topic, -1);
+		chan->topic = NULL;
 		return -1;
 	}
 
@@ -1555,4 +1635,20 @@ void ast_channel_internal_swap_stream_topology(struct ast_channel *chan1,
 int ast_channel_is_multistream(struct ast_channel *chan)
 {
 	return (chan->tech && chan->tech->read_stream && chan->tech->write_stream);
+}
+
+struct ast_channel_snapshot *ast_channel_snapshot(const struct ast_channel *chan)
+{
+	return chan->snapshot;
+}
+
+void ast_channel_snapshot_set(struct ast_channel *chan, struct ast_channel_snapshot *snapshot)
+{
+	ao2_cleanup(chan->snapshot);
+	chan->snapshot = ao2_bump(snapshot);
+}
+
+struct ast_flags *ast_channel_snapshot_segment_flags(struct ast_channel *chan)
+{
+	return &chan->snapshot_segment_flags;
 }

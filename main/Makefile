@@ -141,21 +141,34 @@ endif
 	$(CMD_PREFIX) cat $@.fix >> $@
 	$(CMD_PREFIX) rm $@.fix
 
-ast_expr2f.o: _ASTCFLAGS+=-Wno-unused
-cdr.o: _ASTCFLAGS+=$(AST_NO_FORMAT_TRUNCATION)
-
-db.o: _ASTCFLAGS+=$(SQLITE3_INCLUDE)
-asterisk.o: _ASTCFLAGS+=$(LIBEDIT_INCLUDE)
-json.o: _ASTCFLAGS+=$(JANSSON_INCLUDE)
-bucket.o: _ASTCFLAGS+=$(URIPARSER_INCLUDE)
-crypt.o: _ASTCFLAGS+=$(CRYPT_INCLUDE)
-uuid.o: _ASTCFLAGS+=$(UUID_INCLUDE)
-
 ifneq ($(findstring ENABLE_UPLOADS,$(MENUSELECT_CFLAGS)),)
-http.o: _ASTCFLAGS+=$(GMIME_INCLUDE)
+GMIMELDFLAGS+=$(GMIME_LIB)
+GMIMECFLAGS+=$(GMIME_INCLUDE)
 endif
 
+# Alter CFLAGS for specific sources
 stdtime/localtime.o: _ASTCFLAGS+=$(AST_NO_STRICT_OVERFLOW) -Wno-format-nonliteral
+
+asterisk.o: _ASTCFLAGS+=$(LIBEDIT_INCLUDE)
+ast_expr2f.o: _ASTCFLAGS+=-Wno-unused
+astmm.o: _ASTCFLAGS+=$(call get_menuselect_cflags,MALLOC_DEBUG DEBUG_CHAOS)
+astobj2.o astobj2_container.o astobj2_hash.o astobj2_rbtree.o: _ASTCFLAGS+=$(call get_menuselect_cflags,AO2_DEBUG)
+backtrace.o: _ASTCFLAGS+=$(call get_menuselect_cflags,BETTER_BACKTRACES)
+bucket.o: _ASTCFLAGS+=$(URIPARSER_INCLUDE)
+cdr.o: _ASTCFLAGS+=$(AST_NO_FORMAT_TRUNCATION)
+crypt.o: _ASTCFLAGS+=$(CRYPT_INCLUDE)
+db.o: _ASTCFLAGS+=$(SQLITE3_INCLUDE)
+dsp.o: _ASTCFLAGS+=$(call get_menuselect_cflags,RADIO_RELAX)
+http.o: _ASTCFLAGS+=$(GMIMECFLAGS)
+iostream.o: _ASTCFLAGS+=$(OPENSSL_INCLUDE)
+json.o: _ASTCFLAGS+=$(JANSSON_INCLUDE)
+lock.o: _ASTCFLAGS+=$(call get_menuselect_cflags,DETECT_DEADLOCKS)
+options.o: _ASTCFLAGS+=$(call get_menuselect_cflags,REF_DEBUG)
+sched.o: _ASTCFLAGS+=$(call get_menuselect_cflags,DEBUG_SCHEDULER DUMP_SCHEDULER)
+tcptls.o: _ASTCFLAGS+=$(OPENSSL_INCLUDE) -Wno-deprecated-declarations
+uuid.o: _ASTCFLAGS+=$(UUID_INCLUDE)
+stasis.o: _ASTCFLAGS+=$(call get_menuselect_cflags,AO2_DEBUG)
+
 
 OBJS:=$(sort $(OBJS))
 
@@ -167,10 +180,6 @@ asterisk: cygload
 cygload: asterisk.dll
 else
 MAIN_TGT:=asterisk
-endif
-
-ifneq ($(findstring ENABLE_UPLOADS,$(MENUSELECT_CFLAGS)),)
-GMIMELDFLAGS+=$(GMIME_LIB)
 endif
 
 $(OBJS): _ASTCFLAGS+=-DAST_MODULE=\"core\" -DAST_IN_CORE
@@ -205,7 +214,7 @@ ifeq ($(GNU_LD),1)
 	$(CMD_PREFIX) $(ASTTOPDIR)/build_tools/make_linker_version_script libasteriskssl "$(LINKER_SYMBOL_PREFIX)" "$(ASTTOPDIR)"
 endif
 	$(ECHO_PREFIX) echo "   [LD] $^ -> $@"
-	$(CMD_PREFIX) $(CC) $(STATIC_BUILD) -o $@ $(CC_LDFLAGS_SO) $^ $(CC_LIBS)
+	$(CMD_PREFIX) $(CC) -o $@ $(CC_LDFLAGS_SO) $^ $(CC_LIBS)
 
 $(ASTSSL_LIB): $(ASTSSL_LIB).$(ASTSSL_SO_VERSION)
 	$(ECHO_PREFIX) echo "   [LN] $< -> $@"
@@ -224,7 +233,7 @@ $(ASTSSL_LIB): SOLINK=$(DYLINK)
 # Special rules for building a shared library (not a dynamically loadable module)
 $(ASTSSL_LIB): libasteriskssl.o
 	$(ECHO_PREFIX) echo "   [LD] $^ -> $@"
-	$(CMD_PREFIX) $(CC) $(STATIC_BUILD) -o $@ $(CC_LDFLAGS_SO) $^ $(CC_LIBS)
+	$(CMD_PREFIX) $(CC) -o $@ $(CC_LDFLAGS_SO) $^ $(CC_LIBS)
 endif
 
 endif
@@ -282,7 +291,7 @@ $(ASTPJ_LIB).$(ASTPJ_SO_VERSION): SOLINK=$(DYLINK)
 # type that are built by the standard rules)
 $(ASTPJ_LIB).$(ASTPJ_SO_VERSION): libasteriskpj.o libasteriskpj.exports
 	$(ECHO_PREFIX) echo "   [LD] $< -> $@"
-	$(CMD_PREFIX) $(CC) $(STATIC_BUILD) -o $@ $(CC_LDFLAGS_SO) $< $(CC_LIBS)
+	$(CMD_PREFIX) $(CC) -o $@ $(CC_LDFLAGS_SO) $< $(CC_LIBS)
 
 $(ASTPJ_LIB): $(ASTPJ_LIB).$(ASTPJ_SO_VERSION)
 	$(ECHO_PREFIX) echo "   [LN] $< -> $@"
@@ -301,18 +310,15 @@ $(ASTPJ_LIB): SOLINK=$(DYLINK)
 # Special rules for building a shared library (not a dynamically loadable module)
 $(ASTPJ_LIB): libasteriskpj.o
 	$(ECHO_PREFIX) echo "   [LD] $^ -> $@"
-	$(CMD_PREFIX) $(CC) $(STATIC_BUILD) -o $@ $(CC_LDFLAGS_SO) $^ $(CC_LIBS)
+	$(CMD_PREFIX) $(CC) -o $@ $(CC_LDFLAGS_SO) $^ $(CC_LIBS)
 endif
 
 endif
-
-iostream.o: _ASTCFLAGS+=$(OPENSSL_INCLUDE)
-tcptls.o: _ASTCFLAGS+=$(OPENSSL_INCLUDE) -Wno-deprecated-declarations
 
 $(MAIN_TGT): $(OBJS) $(MOD_OBJS) $(ASTSSL_LIB) $(ASTPJ_LIB)
 	@$(CC) -c -o buildinfo.o $(_ASTCFLAGS) buildinfo.c $(ASTCFLAGS)
 	$(ECHO_PREFIX) echo "   [LD] $(OBJS) $(MOD_OBJS) -> $@"
-	$(CMD_PREFIX) $(CXX) $(STATIC_BUILD) -o $@ $(ASTLINK) $(_ASTLDFLAGS) $(ASTLDFLAGS) $(OBJS) $(MOD_OBJS) $(ASTSSL_LDLIBS) $(ASTPJ_LDLIBS) buildinfo.o $(AST_LIBS) $(GMIMELDFLAGS) $(LIBEDIT_LIB)
+	$(CMD_PREFIX) $(CXX) -o $@ $(ASTLINK) $(_ASTLDFLAGS) $(ASTLDFLAGS) $(OBJS) $(MOD_OBJS) $(ASTSSL_LDLIBS) $(ASTPJ_LDLIBS) buildinfo.o $(AST_LIBS) $(GMIMELDFLAGS) $(LIBEDIT_LIB)
 
 ifeq ($(GNU_LD),1)
 $(MAIN_TGT): asterisk.exports

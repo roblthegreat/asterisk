@@ -148,6 +148,15 @@ extern "C" {
 #define AST_MAX_PUBLIC_UNIQUEID 149
 
 /*!
+ * The number of buckets to store channels or channel information
+ */
+#ifdef LOW_MEMORY
+#define AST_NUM_CHANNEL_BUCKETS 61
+#else
+#define AST_NUM_CHANNEL_BUCKETS 1567
+#endif
+
+/*!
  * Maximum size of an internal Asterisk channel unique ID.
  *
  * \details
@@ -2177,12 +2186,30 @@ int ast_recvchar(struct ast_channel *chan, int timeout);
 
 /*!
  * \brief Send a DTMF digit to a channel.
+ *
  * \param chan channel to act upon
  * \param digit the DTMF digit to send, encoded in ASCII
  * \param duration the duration of the digit ending in ms
+ *
+ * \pre This must only be called by the channel's media handler thread.
+ *
  * \return 0 on success, -1 on failure
  */
 int ast_senddigit(struct ast_channel *chan, char digit, unsigned int duration);
+
+/*!
+ * \brief Send a DTMF digit to a channel from an external thread.
+ *
+ * \param chan channel to act upon
+ * \param digit the DTMF digit to send, encoded in ASCII
+ * \param duration the duration of the digit ending in ms
+ *
+ * \pre This must only be called by threads that are not the channel's
+ * media handler thread.
+ *
+ * \return 0 on success, -1 on failure
+ */
+int ast_senddigit_external(struct ast_channel *chan, char digit, unsigned int duration);
 
 /*!
  * \brief Send a DTMF digit to a channel.
@@ -2632,6 +2659,29 @@ void ast_channel_internal_swap_uniqueid_and_linkedid(struct ast_channel *a, stru
 void ast_channel_internal_swap_topics(struct ast_channel *a, struct ast_channel *b);
 
 /*!
+ * \brief Swap endpoint_forward between two channels
+ * \param a First channel
+ * \param b Second channel
+ * \return void
+ *
+ * \note
+ * This is used in masquerade to exchange endpoint details if one of the two or both
+ * the channels were created with endpoint
+ */
+void ast_channel_internal_swap_endpoint_forward(struct ast_channel *a, struct ast_channel *b);
+
+/*!
+ * \brief Swap snapshots beteween two channels
+ * \param a First channel
+ * \param b Second channel
+ * \return void
+ *
+ * \note
+ * This is used in masquerade to exchange snapshots
+ */
+void ast_channel_internal_swap_snapshots(struct ast_channel *a, struct ast_channel *b);
+
+/*!
  * \brief Set uniqueid and linkedid string value only (not time)
  * \param chan The channel to set the uniqueid to
  * \param uniqueid The uniqueid to set
@@ -2692,15 +2742,31 @@ static inline enum ast_t38_state ast_channel_get_t38_state(struct ast_channel *c
 	return state;
 }
 
-#define CHECK_BLOCKING(c) do { 	 \
-	if (ast_test_flag(ast_channel_flags(c), AST_FLAG_BLOCKING)) {\
-		ast_debug(1, "Thread %p is blocking '%s', already blocked by thread %p in procedure %s\n", \
-			(void *) pthread_self(), ast_channel_name(c), (void *) ast_channel_blocker(c), ast_channel_blockproc(c)); \
-	} else { \
+/*!
+ * \brief Set the blocking indication on the channel.
+ *
+ * \details
+ * Indicate that the thread handling the channel is about to do a blocking
+ * operation to wait for media on the channel.  (poll, read, or write)
+ *
+ * Masquerading and ast_queue_frame() use this indication to wake up the thread.
+ *
+ * \pre The channel needs to be locked
+ */
+#define CHECK_BLOCKING(c) \
+	do { \
+		if (ast_test_flag(ast_channel_flags(c), AST_FLAG_BLOCKING)) { \
+			/* This should not happen as there should only be one thread handling a channel's media at a time. */ \
+			ast_log(LOG_DEBUG, "Thread LWP %d is blocking '%s', already blocked by thread LWP %d in procedure %s\n", \
+				ast_get_tid(), ast_channel_name(c), \
+				ast_channel_blocker_tid(c), ast_channel_blockproc(c)); \
+			ast_assert(0); \
+		} \
+		ast_channel_blocker_tid_set((c), ast_get_tid()); \
 		ast_channel_blocker_set((c), pthread_self()); \
 		ast_channel_blockproc_set((c), __PRETTY_FUNCTION__); \
 		ast_set_flag(ast_channel_flags(c), AST_FLAG_BLOCKING); \
-	} } while (0)
+	} while (0)
 
 ast_group_t ast_get_group(const char *s);
 
@@ -4202,6 +4268,9 @@ enum ast_channel_adsicpe ast_channel_adsicpe(const struct ast_channel *chan);
 void ast_channel_adsicpe_set(struct ast_channel *chan, enum ast_channel_adsicpe value);
 enum ast_channel_state ast_channel_state(const struct ast_channel *chan);
 ast_callid ast_channel_callid(const struct ast_channel *chan);
+struct ast_channel_snapshot *ast_channel_snapshot(const struct ast_channel *chan);
+void ast_channel_snapshot_set(struct ast_channel *chan, struct ast_channel_snapshot *snapshot);
+struct ast_flags *ast_channel_snapshot_segment_flags(struct ast_channel *chan);
 
 /*!
  * \pre chan is locked
@@ -4335,6 +4404,9 @@ int ast_channel_fd_add(struct ast_channel *chan, int value);
 
 pthread_t ast_channel_blocker(const struct ast_channel *chan);
 void ast_channel_blocker_set(struct ast_channel *chan, pthread_t value);
+
+int ast_channel_blocker_tid(const struct ast_channel *chan);
+void ast_channel_blocker_tid_set(struct ast_channel *chan, int tid);
 
 ast_timing_func_t ast_channel_timingfunc(const struct ast_channel *chan);
 void ast_channel_timingfunc_set(struct ast_channel *chan, ast_timing_func_t value);
@@ -4523,21 +4595,6 @@ struct varshead *ast_channel_get_vars(struct ast_channel *chan);
  * \retval ast_channel_topic_all() if \a chan is \c NULL.
  */
 struct stasis_topic *ast_channel_topic(struct ast_channel *chan);
-
-/*!
- * \since 12
- * \brief A topic which publishes the events for a particular channel.
- *
- * \ref ast_channel_snapshot messages are replaced with \ref stasis_cache_update
- *
- * If the given \a chan is \c NULL, ast_channel_topic_all_cached() is returned.
- *
- * \param chan Channel, or \c NULL.
- *
- * \retval Topic for channel's events.
- * \retval ast_channel_topic_all() if \a chan is \c NULL.
- */
-struct stasis_topic *ast_channel_topic_cached(struct ast_channel *chan);
 
 /*!
  * \brief Get the bridge associated with a channel

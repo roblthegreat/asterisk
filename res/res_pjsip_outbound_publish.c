@@ -428,9 +428,11 @@ static void set_transport(struct sip_outbound_publisher *publisher, pjsip_tx_dat
 {
 	if (!ast_strlen_zero(publisher->owner->publish->transport)) {
 		pjsip_tpselector selector = { .type = PJSIP_TPSELECTOR_NONE, };
+
 		ast_sip_set_tpselector_from_transport_name(
 			publisher->owner->publish->transport, &selector);
 		pjsip_tx_data_set_transport(tdata, &selector);
+		ast_sip_tpselector_unref(&selector);
 	}
 }
 
@@ -1435,14 +1437,16 @@ static struct ast_sip_outbound_publish_state *sip_outbound_publish_state_alloc(
 		return NULL;
 	}
 
-	state->client->datastores = ao2_container_alloc(DATASTORE_BUCKETS, datastore_hash, datastore_cmp);
+	state->client->datastores = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		DATASTORE_BUCKETS, datastore_hash, NULL, datastore_cmp);
 	if (!state->client->datastores) {
 		ao2_ref(state, -1);
 		return NULL;
 	}
 
-	state->client->publishers = ao2_container_alloc(DATASTORE_BUCKETS, sip_outbound_publisher_hash_fn,
-							sip_outbound_publisher_cmp_fn);
+	state->client->publishers = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		DATASTORE_BUCKETS,
+		sip_outbound_publisher_hash_fn, NULL, sip_outbound_publisher_cmp_fn);
 	if (!state->client->publishers) {
 		ao2_ref(state, -1);
 		return NULL;
@@ -1555,9 +1559,9 @@ static int sip_outbound_publish_apply(const struct ast_sorcery *sorcery, void *o
 	 * object if created/updated, or keep the old object if an error occurs.
 	 */
 	if (!new_states) {
-		new_states = ao2_container_alloc_options(
-			AO2_ALLOC_OPT_LOCK_NOLOCK, DEFAULT_STATE_BUCKETS,
-			outbound_publish_state_hash, outbound_publish_state_cmp);
+		new_states = ao2_container_alloc_hash(
+			AO2_ALLOC_OPT_LOCK_NOLOCK, 0, DEFAULT_STATE_BUCKETS,
+			outbound_publish_state_hash, NULL, outbound_publish_state_cmp);
 
 		if (!new_states) {
 			ast_log(LOG_ERROR, "Unable to allocate new states container\n");

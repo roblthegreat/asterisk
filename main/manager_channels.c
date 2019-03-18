@@ -493,7 +493,7 @@ struct ast_str *ast_manager_build_channel_state_string_prefix(
 	char *connected_name;
 	int res;
 
-	if (snapshot->tech_properties & AST_CHAN_TP_INTERNAL) {
+	if (snapshot->base->tech_properties & AST_CHAN_TP_INTERNAL) {
 		return NULL;
 	}
 
@@ -502,8 +502,8 @@ struct ast_str *ast_manager_build_channel_state_string_prefix(
 		return NULL;
 	}
 
-	caller_name = ast_escape_c_alloc(snapshot->caller_name);
-	connected_name = ast_escape_c_alloc(snapshot->connected_name);
+	caller_name = ast_escape_c_alloc(snapshot->caller->name);
+	connected_name = ast_escape_c_alloc(snapshot->connected->name);
 
 	res = ast_str_set(&out, 0,
 		"%sChannel: %s\r\n"
@@ -520,20 +520,20 @@ struct ast_str *ast_manager_build_channel_state_string_prefix(
 		"%sPriority: %d\r\n"
 		"%sUniqueid: %s\r\n"
 		"%sLinkedid: %s\r\n",
-		prefix, snapshot->name,
+		prefix, snapshot->base->name,
 		prefix, snapshot->state,
 		prefix, ast_state2str(snapshot->state),
-		prefix, S_OR(snapshot->caller_number, "<unknown>"),
+		prefix, S_OR(snapshot->caller->number, "<unknown>"),
 		prefix, S_OR(caller_name, "<unknown>"),
-		prefix, S_OR(snapshot->connected_number, "<unknown>"),
+		prefix, S_OR(snapshot->connected->number, "<unknown>"),
 		prefix, S_OR(connected_name, "<unknown>"),
-		prefix, snapshot->language,
-		prefix, snapshot->accountcode,
-		prefix, snapshot->context,
-		prefix, snapshot->exten,
-		prefix, snapshot->priority,
-		prefix, snapshot->uniqueid,
-		prefix, snapshot->linkedid);
+		prefix, snapshot->base->language,
+		prefix, snapshot->base->accountcode,
+		prefix, snapshot->dialplan->context,
+		prefix, snapshot->dialplan->exten,
+		prefix, snapshot->dialplan->priority,
+		prefix, snapshot->base->uniqueid,
+		prefix, snapshot->peer->linkedid);
 
 	ast_free(caller_name);
 	ast_free(connected_name);
@@ -576,11 +576,6 @@ static struct ast_manager_event_blob *channel_state_change(
 {
 	int is_hungup, was_hungup;
 
-	if (!new_snapshot) {
-		/* Ignore cache clearing events; we'll see the hangup first */
-		return NULL;
-	}
-
 	/* The Newchannel, Newstate and Hangup events are closely related, in
 	 * in that they are mutually exclusive, basically different flavors
 	 * of a new channel state event.
@@ -599,8 +594,8 @@ static struct ast_manager_event_blob *channel_state_change(
 			EVENT_FLAG_CALL, "Hangup",
 			"Cause: %d\r\n"
 			"Cause-txt: %s\r\n",
-			new_snapshot->hangupcause,
-			ast_cause2str(new_snapshot->hangupcause));
+			new_snapshot->hangup->cause,
+			ast_cause2str(new_snapshot->hangup->cause));
 	}
 
 	if (old_snapshot->state != new_snapshot->state) {
@@ -616,13 +611,8 @@ static struct ast_manager_event_blob *channel_newexten(
 	struct ast_channel_snapshot *old_snapshot,
 	struct ast_channel_snapshot *new_snapshot)
 {
-	/* No Newexten event on cache clear */
-	if (!new_snapshot) {
-		return NULL;
-	}
-
 	/* Empty application is not valid for a Newexten event */
-	if (ast_strlen_zero(new_snapshot->appl)) {
+	if (ast_strlen_zero(new_snapshot->dialplan->appl)) {
 		return NULL;
 	}
 
@@ -638,13 +628,13 @@ static struct ast_manager_event_blob *channel_newexten(
 
 	/* DEPRECATED: Extension field deprecated in 12; remove in 14 */
 	return ast_manager_event_blob_create(
-		EVENT_FLAG_CALL, "Newexten",
+		EVENT_FLAG_DIALPLAN, "Newexten",
 		"Extension: %s\r\n"
 		"Application: %s\r\n"
 		"AppData: %s\r\n",
-		new_snapshot->exten,
-		new_snapshot->appl,
-		new_snapshot->data);
+		new_snapshot->dialplan->exten,
+		new_snapshot->dialplan->appl,
+		new_snapshot->dialplan->data);
 }
 
 static struct ast_manager_event_blob *channel_new_callerid(
@@ -654,8 +644,8 @@ static struct ast_manager_event_blob *channel_new_callerid(
 	struct ast_manager_event_blob *res;
 	char *callerid;
 
-	/* No NewCallerid event on cache clear or first event */
-	if (!old_snapshot || !new_snapshot) {
+	/* No NewCallerid event on first channel snapshot */
+	if (!old_snapshot) {
 		return NULL;
 	}
 
@@ -664,14 +654,14 @@ static struct ast_manager_event_blob *channel_new_callerid(
 	}
 
 	if (!(callerid = ast_escape_c_alloc(
-		      ast_describe_caller_presentation(new_snapshot->caller_pres)))) {
+		      ast_describe_caller_presentation(new_snapshot->caller->pres)))) {
 		return NULL;
 	}
 
 	res = ast_manager_event_blob_create(
 		EVENT_FLAG_CALL, "NewCallerid",
 		"CID-CallingPres: %d (%s)\r\n",
-		new_snapshot->caller_pres,
+		new_snapshot->caller->pres,
 		callerid);
 
 	ast_free(callerid);
@@ -682,8 +672,8 @@ static struct ast_manager_event_blob *channel_new_connected_line(
 	struct ast_channel_snapshot *old_snapshot,
 	struct ast_channel_snapshot *new_snapshot)
 {
-	/* No NewConnectedLine event on cache clear or first event */
-	if (!old_snapshot || !new_snapshot) {
+	/* No NewConnectedLine event on first channel snapshot */
+	if (!old_snapshot) {
 		return NULL;
 	}
 
@@ -699,17 +689,17 @@ static struct ast_manager_event_blob *channel_new_accountcode(
 	struct ast_channel_snapshot *old_snapshot,
 	struct ast_channel_snapshot *new_snapshot)
 {
-	if (!old_snapshot || !new_snapshot) {
+	if (!old_snapshot) {
 		return NULL;
 	}
 
-	if (!strcmp(old_snapshot->accountcode, new_snapshot->accountcode)) {
+	if (!strcmp(old_snapshot->base->accountcode, new_snapshot->base->accountcode)) {
 		return NULL;
 	}
 
 	return ast_manager_event_blob_create(
 		EVENT_FLAG_CALL, "NewAccountCode",
-		"OldAccountCode: %s\r\n", old_snapshot->accountcode);
+		"OldAccountCode: %s\r\n", old_snapshot->base->accountcode);
 }
 
 channel_snapshot_monitor channel_monitors[] = {
@@ -724,21 +714,14 @@ static void channel_snapshot_update(void *data, struct stasis_subscription *sub,
 				    struct stasis_message *message)
 {
 	RAII_VAR(struct ast_str *, channel_event_string, NULL, ast_free);
-	struct stasis_cache_update *update;
-	struct ast_channel_snapshot *old_snapshot;
-	struct ast_channel_snapshot *new_snapshot;
+	struct ast_channel_snapshot_update *update;
 	size_t i;
 
 	update = stasis_message_data(message);
 
-	ast_assert(ast_channel_snapshot_type() == update->type);
-
-	old_snapshot = stasis_message_data(update->old_snapshot);
-	new_snapshot = stasis_message_data(update->new_snapshot);
-
 	for (i = 0; i < ARRAY_LEN(channel_monitors); ++i) {
 		RAII_VAR(struct ast_manager_event_blob *, ev, NULL, ao2_cleanup);
-		ev = channel_monitors[i](old_snapshot, new_snapshot);
+		ev = channel_monitors[i](update->old_snapshot, update->new_snapshot);
 
 		if (!ev) {
 			continue;
@@ -747,7 +730,7 @@ static void channel_snapshot_update(void *data, struct stasis_subscription *sub,
 		/* If we haven't already, build the channel event string */
 		if (!channel_event_string) {
 			channel_event_string =
-				ast_manager_build_channel_state_string(new_snapshot);
+				ast_manager_build_channel_state_string(update->new_snapshot);
 			if (!channel_event_string) {
 				return;
 			}
@@ -988,11 +971,11 @@ static void channel_hangup_handler_cb(void *data, struct stasis_subscription *su
 		return;
 	}
 
-	if (!strcmp(action, "type")) {
+	if (!strcmp(action, "run")) {
 		event = "HangupHandlerRun";
-	} else if (!strcmp(action, "type")) {
+	} else if (!strcmp(action, "pop")) {
 		event = "HangupHandlerPop";
-	} else if (!strcmp(action, "type")) {
+	} else if (!strcmp(action, "push")) {
 		event = "HangupHandlerPush";
 	} else {
 		return;
@@ -1260,7 +1243,7 @@ int manager_channels_init(void)
 	if (!message_router) {
 		return -1;
 	}
-	channel_topic = ast_channel_topic_all_cached();
+	channel_topic = ast_channel_topic_all();
 	if (!channel_topic) {
 		return -1;
 	}
@@ -1272,7 +1255,11 @@ int manager_channels_init(void)
 
 	ast_register_cleanup(manager_channels_shutdown);
 
-	ret |= stasis_message_router_add_cache_update(message_router,
+	/* The snapshot type has a special handler as it can result in multiple
+	 * manager events being queued due to aspects of the snapshot itself
+	 * changing.
+	 */
+	ret |= stasis_message_router_add(message_router,
 		ast_channel_snapshot_type(), channel_snapshot_update, NULL);
 
 	ret |= stasis_message_router_add(message_router,

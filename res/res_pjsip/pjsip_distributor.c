@@ -51,6 +51,7 @@ static unsigned int unidentified_count;
 static unsigned int unidentified_period;
 static unsigned int unidentified_prune_interval;
 static int using_auth_username;
+static enum ast_sip_taskprocessor_overload_trigger overload_trigger;
 
 struct unidentified_request{
 	struct timeval first_seen;
@@ -534,18 +535,31 @@ static pj_bool_t distributor(pjsip_rx_data *rdata)
 		ao2_cleanup(dist);
 		return PJ_TRUE;
 	} else {
-		if (ast_taskprocessor_alert_get()) {
+		if ((overload_trigger == TASKPROCESSOR_OVERLOAD_TRIGGER_GLOBAL &&
+			ast_taskprocessor_alert_get())
+			|| (overload_trigger == TASKPROCESSOR_OVERLOAD_TRIGGER_PJSIP_ONLY &&
+			ast_taskprocessor_get_subsystem_alert("pjsip"))) {
 			/*
 			 * When taskprocessors get backed up, there is a good chance that
 			 * we are being overloaded and need to defer adding new work to
 			 * the system.  To defer the work we will ignore the request and
 			 * rely on the peer's transport layer to retransmit the message.
-			 * We usually work off the overload within a few seconds.  The
-			 * alternative is to send back a 503 response to these requests
-			 * and be done with it.
+			 * We usually work off the overload within a few seconds.
+			 * If transport is non-UDP we send a 503 response instead.
 			 */
-			ast_debug(3, "Taskprocessor overload alert: Ignoring '%s'.\n",
-				pjsip_rx_data_get_info(rdata));
+			switch (rdata->tp_info.transport->key.type) {
+			case PJSIP_TRANSPORT_UDP6:
+			case PJSIP_TRANSPORT_UDP:
+				ast_debug(3, "Taskprocessor overload alert: Ignoring '%s'.\n",
+					pjsip_rx_data_get_info(rdata));
+				break;
+			default:
+				ast_debug(3, "Taskprocessor overload on non-udp transport. Received:'%s'. "
+					"Responding with a 503.\n", pjsip_rx_data_get_info(rdata));
+				pjsip_endpt_respond_stateless(ast_sip_get_pjsip_endpoint(), rdata,
+					PJSIP_SC_SERVICE_UNAVAILABLE, NULL, NULL, NULL);
+				break;
+			}
 			ao2_cleanup(dist);
 			return PJ_TRUE;
 		}
@@ -648,16 +662,21 @@ static void log_failed_request(pjsip_rx_data *rdata, char *msg, unsigned int cou
 	char from_buf[PJSIP_MAX_URL_SIZE];
 	char callid_buf[PJSIP_MAX_URL_SIZE];
 	char method_buf[PJSIP_MAX_URL_SIZE];
+	char src_addr_buf[AST_SOCKADDR_BUFLEN];
 	pjsip_uri_print(PJSIP_URI_IN_FROMTO_HDR, rdata->msg_info.from->uri, from_buf, PJSIP_MAX_URL_SIZE);
 	ast_copy_pj_str(callid_buf, &rdata->msg_info.cid->id, PJSIP_MAX_URL_SIZE);
 	ast_copy_pj_str(method_buf, &rdata->msg_info.msg->line.req.method.name, PJSIP_MAX_URL_SIZE);
 	if (count) {
-		ast_log(LOG_NOTICE, "Request '%s' from '%s' failed for '%s:%d' (callid: %s) - %s"
+		ast_log(LOG_NOTICE, "Request '%s' from '%s' failed for '%s' (callid: %s) - %s"
 			" after %u tries in %.3f ms\n",
-			method_buf, from_buf, rdata->pkt_info.src_name, rdata->pkt_info.src_port, callid_buf, msg, count, period / 1000.0);
+			method_buf, from_buf,
+			pj_sockaddr_print(&rdata->pkt_info.src_addr, src_addr_buf, sizeof(src_addr_buf), 3),
+			callid_buf, msg, count, period / 1000.0);
 	} else {
-		ast_log(LOG_NOTICE, "Request '%s' from '%s' failed for '%s:%d' (callid: %s) - %s\n",
-			method_buf, from_buf, rdata->pkt_info.src_name, rdata->pkt_info.src_port, callid_buf, msg);
+		ast_log(LOG_NOTICE, "Request '%s' from '%s' failed for '%s' (callid: %s) - %s\n",
+			method_buf, from_buf,
+			pj_sockaddr_print(&rdata->pkt_info.src_addr, src_addr_buf, sizeof(src_addr_buf), 3),
+			callid_buf, msg);
 	}
 }
 
@@ -674,6 +693,26 @@ static void check_endpoint(pjsip_rx_data *rdata, struct unidentified_request *un
 		ast_sip_report_invalid_endpoint(name, rdata);
 	}
 	ao2_unlock(unid);
+}
+
+static int apply_endpoint_acl(pjsip_rx_data *rdata, struct ast_sip_endpoint *endpoint);
+static int apply_endpoint_contact_acl(pjsip_rx_data *rdata, struct ast_sip_endpoint *endpoint);
+
+static void apply_acls(pjsip_rx_data *rdata)
+{
+	struct ast_sip_endpoint *endpoint;
+
+	/* Is the endpoint allowed with the source or contact address? */
+	endpoint = rdata->endpt_info.mod_data[endpoint_mod.id];
+	if (endpoint != artificial_endpoint
+		&& (apply_endpoint_acl(rdata, endpoint)
+			|| apply_endpoint_contact_acl(rdata, endpoint))) {
+		ast_debug(1, "Endpoint '%s' not allowed by ACL\n",
+			ast_sorcery_object_get_id(endpoint));
+
+		/* Replace the rdata endpoint with the artificial endpoint. */
+		ao2_replace(rdata->endpt_info.mod_data[endpoint_mod.id], artificial_endpoint);
+	}
 }
 
 static pj_bool_t endpoint_lookup(pjsip_rx_data *rdata)
@@ -695,6 +734,7 @@ static pj_bool_t endpoint_lookup(pjsip_rx_data *rdata)
 			ao2_unlink(unidentified_requests, unid);
 			ao2_ref(unid, -1);
 		}
+		apply_acls(rdata);
 		return PJ_FALSE;
 	}
 
@@ -759,6 +799,8 @@ static pj_bool_t endpoint_lookup(pjsip_rx_data *rdata)
 			ast_sip_report_invalid_endpoint(name, rdata);
 		}
 	}
+
+	apply_acls(rdata);
 	return PJ_FALSE;
 }
 
@@ -842,16 +884,11 @@ static pj_bool_t authenticate(pjsip_rx_data *rdata)
 
 	ast_assert(endpoint != NULL);
 
-	if (endpoint!=artificial_endpoint) {
-		if (apply_endpoint_acl(rdata, endpoint) || apply_endpoint_contact_acl(rdata, endpoint)) {
-			if (!is_ack) {
-				pjsip_endpt_respond_stateless(ast_sip_get_pjsip_endpoint(), rdata, 403, NULL, NULL, NULL);
-			}
-			return PJ_TRUE;
-		}
+	if (is_ack) {
+		return PJ_FALSE;
 	}
 
-	if (!is_ack && ast_sip_requires_authentication(endpoint, rdata)) {
+	if (ast_sip_requires_authentication(endpoint, rdata)) {
 		pjsip_tx_data *tdata;
 		struct unidentified_request *unid;
 
@@ -888,6 +925,10 @@ static pj_bool_t authenticate(pjsip_rx_data *rdata)
 			return PJ_TRUE;
 		}
 		pjsip_tx_data_dec_ref(tdata);
+	} else if (endpoint == artificial_endpoint) {
+		/* Uh. Oh.  The artificial endpoint couldn't challenge so block the request. */
+		pjsip_endpt_respond_stateless(ast_sip_get_pjsip_endpoint(), rdata, 500, NULL, NULL, NULL);
+		return PJ_TRUE;
 	}
 
 	return PJ_FALSE;
@@ -1158,6 +1199,8 @@ static void global_loaded(const char *object_type)
 	ao2_cleanup(fake_auth);
 
 	ast_sip_get_unidentified_request_thresholds(&unidentified_count, &unidentified_period, &unidentified_prune_interval);
+
+	overload_trigger = ast_sip_get_taskprocessor_overload_trigger();
 
 	/* Clean out the old task, if any */
 	ast_sched_clean_by_callback(prune_context, prune_task, clean_task);

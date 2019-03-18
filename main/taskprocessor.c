@@ -67,10 +67,8 @@ struct tps_taskprocessor_stats {
 
 /*! \brief A ast_taskprocessor structure is a singleton by name */
 struct ast_taskprocessor {
-	/*! \brief Friendly name of the taskprocessor */
-	const char *name;
 	/*! \brief Taskprocessor statistics */
-	struct tps_taskprocessor_stats *stats;
+	struct tps_taskprocessor_stats stats;
 	void *local_data;
 	/*! \brief Taskprocessor current queue size */
 	long tps_queue_size;
@@ -91,6 +89,12 @@ struct ast_taskprocessor {
 	unsigned int high_water_alert:1;
 	/*! Indicates if the taskprocessor is currently suspended */
 	unsigned int suspended:1;
+	/*! \brief Anything before the first '/' in the name (if there is one) */
+	char *subsystem;
+	/*! \brief Friendly name of the taskprocessor.
+	 * Subsystem is appended after the name's NULL terminator.
+	 */
+	char name[0];
 };
 
 /*!
@@ -111,6 +115,16 @@ struct ast_taskprocessor_listener {
 	/*! Data private to the listener */
 	void *user_data;
 };
+
+/*!
+ * Keep track of which subsystems are in alert
+ * and how many of their taskprocessors are overloaded.
+ */
+struct subsystem_alert {
+	unsigned int alert_count;
+	char subsystem[0];
+};
+static AST_VECTOR_RW(subsystem_alert_vector, struct subsystem_alert *) overloaded_subsystems;
 
 #ifdef LOW_MEMORY
 #define TPS_MAX_BUCKETS 61
@@ -138,10 +152,12 @@ static int tps_ping_handler(void *datap);
 
 static char *cli_tps_ping(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *cli_tps_report(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *cli_subsystem_alert_report(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 
 static struct ast_cli_entry taskprocessor_clis[] = {
 	AST_CLI_DEFINE(cli_tps_ping, "Ping a named task processor"),
 	AST_CLI_DEFINE(cli_tps_report, "List instantiated task processors and statistics"),
+	AST_CLI_DEFINE(cli_subsystem_alert_report, "List task processor subsystems in alert"),
 };
 
 struct default_taskprocessor_listener_pvt {
@@ -235,7 +251,11 @@ static void default_listener_shutdown(struct ast_taskprocessor_listener *listene
 	/* Hold a reference during shutdown */
 	ao2_t_ref(listener->tps, +1, "tps-shutdown");
 
-	ast_taskprocessor_push(listener->tps, default_listener_die, pvt);
+	if (ast_taskprocessor_push(listener->tps, default_listener_die, pvt)) {
+		/* This will cause the thread to exit early without completing tasks already
+		 * in the queue.  This is probably the least bad option in this situation. */
+		default_listener_die(pvt);
+	}
 
 	ast_assert(pvt->poll_thread != AST_PTHREADT_NULL);
 
@@ -267,6 +287,8 @@ static const struct ast_taskprocessor_listener_callbacks default_listener_callba
 static void tps_shutdown(void)
 {
 	ast_cli_unregister_multiple(taskprocessor_clis, ARRAY_LEN(taskprocessor_clis));
+	AST_VECTOR_CALLBACK_VOID(&overloaded_subsystems, ast_free);
+	AST_VECTOR_RW_FREE(&overloaded_subsystems);
 	ao2_t_ref(tps_singletons, -1, "Unref tps_singletons in shutdown");
 	tps_singletons = NULL;
 }
@@ -274,8 +296,16 @@ static void tps_shutdown(void)
 /* initialize the taskprocessor container and register CLI operations */
 int ast_tps_init(void)
 {
-	if (!(tps_singletons = ao2_container_alloc(TPS_MAX_BUCKETS, tps_hash_cb, tps_cmp_cb))) {
+	tps_singletons = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		TPS_MAX_BUCKETS, tps_hash_cb, NULL, tps_cmp_cb);
+	if (!tps_singletons) {
 		ast_log(LOG_ERROR, "taskprocessor container failed to initialize!\n");
+		return -1;
+	}
+
+	if (AST_VECTOR_RW_INIT(&overloaded_subsystems, 10)) {
+		ao2_ref(tps_singletons, -1);
+		ast_log(LOG_ERROR, "taskprocessor subsystems vector failed to initialize!\n");
 		return -1;
 	}
 
@@ -511,13 +541,8 @@ static char *cli_tps_report(struct ast_cli_entry *e, int cmd, struct ast_cli_arg
 	while ((tps = ao2_iterator_next(&iter))) {
 		ast_copy_string(name, tps->name, sizeof(name));
 		qsize = tps->tps_queue_size;
-		if (tps->stats) {
-			maxqsize = tps->stats->max_qsize;
-			processed = tps->stats->_tasks_processed_count;
-		} else {
-			maxqsize = 0;
-			processed = 0;
-		}
+		maxqsize = tps->stats.max_qsize;
+		processed = tps->stats._tasks_processed_count;
 		ast_cli(a->fd, FMT_FIELDS, name, processed, qsize, maxqsize,
 			tps->tps_queue_low, tps->tps_queue_high);
 		ast_taskprocessor_unreference(tps);
@@ -546,6 +571,157 @@ static int tps_cmp_cb(void *obj, void *arg, int flags)
 
 	return !strcasecmp(lhs->name, rhsname) ? CMP_MATCH | CMP_STOP : 0;
 }
+
+static int subsystem_match(struct subsystem_alert *alert, const char *subsystem)
+{
+	return !strcmp(alert->subsystem, subsystem);
+}
+
+static int subsystem_cmp(struct subsystem_alert *a, struct subsystem_alert *b)
+{
+	return strcmp(a->subsystem, b->subsystem);
+}
+
+unsigned int ast_taskprocessor_get_subsystem_alert(const char *subsystem)
+{
+	struct subsystem_alert *alert;
+	unsigned int count = 0;
+	int idx;
+
+	AST_VECTOR_RW_RDLOCK(&overloaded_subsystems);
+	idx = AST_VECTOR_GET_INDEX(&overloaded_subsystems, subsystem, subsystem_match);
+	if (idx >= 0) {
+		alert = AST_VECTOR_GET(&overloaded_subsystems, idx);
+		count = alert->alert_count;
+	}
+	AST_VECTOR_RW_UNLOCK(&overloaded_subsystems);
+
+	return count;
+}
+
+static void subsystem_alert_increment(const char *subsystem)
+{
+	struct subsystem_alert *alert;
+	int idx;
+
+	if (ast_strlen_zero(subsystem)) {
+		return;
+	}
+
+	AST_VECTOR_RW_WRLOCK(&overloaded_subsystems);
+	idx = AST_VECTOR_GET_INDEX(&overloaded_subsystems, subsystem, subsystem_match);
+	if (idx >= 0) {
+		alert = AST_VECTOR_GET(&overloaded_subsystems, idx);
+		alert->alert_count++;
+		AST_VECTOR_RW_UNLOCK(&overloaded_subsystems);
+		return;
+	}
+
+	alert = ast_malloc(sizeof(*alert) + strlen(subsystem) + 1);
+	if (!alert) {
+		AST_VECTOR_RW_UNLOCK(&overloaded_subsystems);
+		return;
+	}
+	alert->alert_count = 1;
+	strcpy(alert->subsystem, subsystem); /* Safe */
+
+	if (AST_VECTOR_APPEND(&overloaded_subsystems, alert)) {
+		ast_free(alert);
+	}
+	AST_VECTOR_RW_UNLOCK(&overloaded_subsystems);
+}
+
+static void subsystem_alert_decrement(const char *subsystem)
+{
+	struct subsystem_alert *alert;
+	int idx;
+
+	if (ast_strlen_zero(subsystem)) {
+		return;
+	}
+
+	AST_VECTOR_RW_WRLOCK(&overloaded_subsystems);
+	idx = AST_VECTOR_GET_INDEX(&overloaded_subsystems, subsystem, subsystem_match);
+	if (idx < 0) {
+		ast_log(LOG_ERROR,
+			"Can't decrement alert count for subsystem '%s' as it wasn't in alert\n", subsystem);
+		AST_VECTOR_RW_UNLOCK(&overloaded_subsystems);
+		return;
+	}
+	alert = AST_VECTOR_GET(&overloaded_subsystems, idx);
+
+	alert->alert_count--;
+	if (alert->alert_count <= 0) {
+		AST_VECTOR_REMOVE(&overloaded_subsystems, idx, 0);
+		ast_free(alert);
+	}
+
+	AST_VECTOR_RW_UNLOCK(&overloaded_subsystems);
+}
+
+static void subsystem_copy(struct subsystem_alert *alert,
+	struct subsystem_alert_vector *vector)
+{
+	struct subsystem_alert *alert_copy;
+	alert_copy = ast_malloc(sizeof(*alert_copy) + strlen(alert->subsystem) + 1);
+	if (!alert_copy) {
+		return;
+	}
+	alert_copy->alert_count = alert->alert_count;
+	strcpy(alert_copy->subsystem, alert->subsystem); /* Safe */
+	if (AST_VECTOR_ADD_SORTED(vector, alert_copy, subsystem_cmp)) {
+		ast_free(alert_copy);
+	}
+}
+
+static char *cli_subsystem_alert_report(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct subsystem_alert_vector sorted_subsystems;
+	int i;
+
+#define FMT_HEADERS_SUBSYSTEM		"%-32s %12s\n"
+#define FMT_FIELDS_SUBSYSTEM		"%-32s %12u\n"
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "core show taskprocessor alerted subsystems";
+		e->usage =
+			"Usage: core show taskprocessor alerted subsystems\n"
+			"	Shows a list of task processor subsystems that are currently alerted\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc != e->args) {
+		return CLI_SHOWUSAGE;
+	}
+
+	if (AST_VECTOR_INIT(&sorted_subsystems, AST_VECTOR_SIZE(&overloaded_subsystems))) {
+		return CLI_FAILURE;
+	}
+
+	AST_VECTOR_RW_RDLOCK(&overloaded_subsystems);
+	for (i = 0; i < AST_VECTOR_SIZE(&overloaded_subsystems); i++) {
+		subsystem_copy(AST_VECTOR_GET(&overloaded_subsystems, i), &sorted_subsystems);
+	}
+	AST_VECTOR_RW_UNLOCK(&overloaded_subsystems);
+
+	ast_cli(a->fd, "\n" FMT_HEADERS_SUBSYSTEM, "Subsystem", "Alert Count");
+
+	for (i = 0; i < AST_VECTOR_SIZE(&sorted_subsystems); i++) {
+		struct subsystem_alert *alert = AST_VECTOR_GET(&sorted_subsystems, i);
+		ast_cli(a->fd, FMT_FIELDS_SUBSYSTEM, alert->subsystem, alert->alert_count);
+	}
+
+	ast_cli(a->fd, "\n%zu subsystems\n\n", AST_VECTOR_SIZE(&sorted_subsystems));
+
+	AST_VECTOR_CALLBACK_VOID(&sorted_subsystems, ast_free);
+	AST_VECTOR_FREE(&sorted_subsystems);
+
+	return CLI_SUCCESS;
+}
+
 
 /*! Count of the number of taskprocessors in high water alert. */
 static unsigned int tps_alert_count;
@@ -576,6 +752,15 @@ static void tps_alert_add(struct ast_taskprocessor *tps, int delta)
 		ast_log(LOG_DEBUG, "Taskprocessor '%s' %s the high water alert.\n",
 			tps->name, tps_alert_count ? "triggered" : "cleared");
 	}
+
+	if (tps->subsystem[0] != '\0') {
+		if (delta > 0) {
+			subsystem_alert_increment(tps->subsystem);
+		} else {
+			subsystem_alert_decrement(tps->subsystem);
+		}
+	}
+
 	ast_rwlock_unlock(&tps_alert_lock);
 }
 
@@ -641,10 +826,6 @@ static void tps_taskprocessor_dtor(void *tps)
 		tps_alert_add(t, -1);
 	}
 
-	ast_free(t->stats);
-	t->stats = NULL;
-	ast_free((char *) t->name);
-	t->name = NULL;
 	ao2_cleanup(t->listener);
 	t->listener = NULL;
 }
@@ -736,11 +917,31 @@ static void *default_listener_pvt_alloc(void)
 	return pvt;
 }
 
+/*!
+ * \internal
+ * \brief Allocate a task processor structure
+ *
+ * \param name Name of the task processor.
+ * \param listener Listener to associate with the task processor.
+ *
+ * \return The newly allocated task processor.
+ *
+ * \pre tps_singletons must be locked by the caller.
+ */
 static struct ast_taskprocessor *__allocate_taskprocessor(const char *name, struct ast_taskprocessor_listener *listener)
 {
 	struct ast_taskprocessor *p;
+	char *subsystem_separator;
+	size_t subsystem_length = 0;
+	size_t name_length;
 
-	p = ao2_alloc(sizeof(*p), tps_taskprocessor_dtor);
+	name_length = strlen(name);
+	subsystem_separator = strchr(name, '/');
+	if (subsystem_separator) {
+		subsystem_length = subsystem_separator - name;
+	}
+
+	p = ao2_alloc(sizeof(*p) + name_length + subsystem_length + 2, tps_taskprocessor_dtor);
 	if (!p) {
 		ast_log(LOG_WARNING, "failed to create taskprocessor '%s'\n", name);
 		return NULL;
@@ -750,12 +951,9 @@ static struct ast_taskprocessor *__allocate_taskprocessor(const char *name, stru
 	p->tps_queue_low = (AST_TASKPROCESSOR_HIGH_WATER_LEVEL * 9) / 10;
 	p->tps_queue_high = AST_TASKPROCESSOR_HIGH_WATER_LEVEL;
 
-	p->stats = ast_calloc(1, sizeof(*p->stats));
-	p->name = ast_strdup(name);
-	if (!p->stats || !p->name) {
-		ao2_ref(p, -1);
-		return NULL;
-	}
+	strcpy(p->name, name); /* Safe */
+	p->subsystem = p->name + name_length + 1;
+	ast_copy_string(p->subsystem, name, subsystem_length + 1);
 
 	ao2_ref(listener, +1);
 	p->listener = listener;
@@ -765,17 +963,23 @@ static struct ast_taskprocessor *__allocate_taskprocessor(const char *name, stru
 	ao2_ref(p, +1);
 	listener->tps = p;
 
-	if (!(ao2_link(tps_singletons, p))) {
+	if (!(ao2_link_flags(tps_singletons, p, OBJ_NOLOCK))) {
 		ast_log(LOG_ERROR, "Failed to add taskprocessor '%s' to container\n", p->name);
 		listener->tps = NULL;
 		ao2_ref(p, -2);
 		return NULL;
 	}
 
-	if (p->listener->callbacks->start(p->listener)) {
+	return p;
+}
+
+static struct ast_taskprocessor *__start_taskprocessor(struct ast_taskprocessor *p)
+{
+	if (p && p->listener->callbacks->start(p->listener)) {
 		ast_log(LOG_ERROR, "Unable to start taskprocessor listener for taskprocessor %s\n",
 			p->name);
 		ast_taskprocessor_unreference(p);
+
 		return NULL;
 	}
 
@@ -795,40 +999,51 @@ struct ast_taskprocessor *ast_taskprocessor_get(const char *name, enum ast_tps_o
 		ast_log(LOG_ERROR, "requesting a nameless taskprocessor!!!\n");
 		return NULL;
 	}
-	p = ao2_find(tps_singletons, name, OBJ_KEY);
-	if (p) {
+	ao2_lock(tps_singletons);
+	p = ao2_find(tps_singletons, name, OBJ_KEY | OBJ_NOLOCK);
+	if (p || (create & TPS_REF_IF_EXISTS)) {
+		/* calling function does not want a new taskprocessor to be created if it doesn't already exist */
+		ao2_unlock(tps_singletons);
 		return p;
 	}
-	if (create & TPS_REF_IF_EXISTS) {
-		/* calling function does not want a new taskprocessor to be created if it doesn't already exist */
-		return NULL;
-	}
+
 	/* Create a new taskprocessor. Start by creating a default listener */
 	pvt = default_listener_pvt_alloc();
 	if (!pvt) {
+		ao2_unlock(tps_singletons);
 		return NULL;
 	}
 	listener = ast_taskprocessor_listener_alloc(&default_listener_callbacks, pvt);
 	if (!listener) {
+		ao2_unlock(tps_singletons);
 		default_listener_pvt_destroy(pvt);
 		return NULL;
 	}
 
 	p = __allocate_taskprocessor(name, listener);
-
+	ao2_unlock(tps_singletons);
+	p = __start_taskprocessor(p);
 	ao2_ref(listener, -1);
+
 	return p;
 }
 
 struct ast_taskprocessor *ast_taskprocessor_create_with_listener(const char *name, struct ast_taskprocessor_listener *listener)
 {
-	struct ast_taskprocessor *p = ao2_find(tps_singletons, name, OBJ_KEY);
+	struct ast_taskprocessor *p;
 
+	ao2_lock(tps_singletons);
+	p = ao2_find(tps_singletons, name, OBJ_KEY | OBJ_NOLOCK);
 	if (p) {
+		ao2_unlock(tps_singletons);
 		ast_taskprocessor_unreference(p);
 		return NULL;
 	}
-	return __allocate_taskprocessor(name, listener);
+
+	p = __allocate_taskprocessor(name, listener);
+	ao2_unlock(tps_singletons);
+
+	return __start_taskprocessor(p);
 }
 
 void ast_taskprocessor_set_local(struct ast_taskprocessor *tps,
@@ -981,13 +1196,11 @@ int ast_taskprocessor_execute(struct ast_taskprocessor *tps)
 	size = ast_taskprocessor_size(tps);
 
 	/* Update the stats */
-	if (tps->stats) {
-		++tps->stats->_tasks_processed_count;
+	++tps->stats._tasks_processed_count;
 
-		/* Include the task we just executed as part of the queue size. */
-		if (size >= tps->stats->max_qsize) {
-			tps->stats->max_qsize = size + 1;
-		}
+	/* Include the task we just executed as part of the queue size. */
+	if (size >= tps->stats.max_qsize) {
+		tps->stats.max_qsize = size + 1;
 	}
 	ao2_unlock(tps);
 

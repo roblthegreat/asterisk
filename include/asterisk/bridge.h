@@ -75,6 +75,7 @@ extern "C" {
 #include "asterisk/dsp.h"
 #include "asterisk/uuid.h"
 
+struct a02_container;
 struct ast_bridge_technology;
 struct ast_bridge;
 struct ast_bridge_tech_optimizations;
@@ -290,9 +291,49 @@ struct ast_bridge_softmix {
 	unsigned int internal_mixing_interval;
 	/*! TRUE if binaural convolve is activated in configuration. */
 	unsigned int binaural_active;
+	/*!
+	 * Add a "label" attribute to each stream in the SDP containing
+	 * the channel uniqueid.  Used for participant info correlation.
+	 */
+	unsigned int send_sdp_label;
 };
 
 AST_LIST_HEAD_NOLOCK(ast_bridge_channels_list, ast_bridge_channel);
+
+/*!
+ * \brief Structure that contains a snapshot of information about a bridge
+ */
+struct ast_bridge_snapshot {
+	AST_DECLARE_STRING_FIELDS(
+		/*! Immutable bridge UUID. */
+		AST_STRING_FIELD(uniqueid);
+		/*! Bridge technology that is handling the bridge */
+		AST_STRING_FIELD(technology);
+		/*! Bridge subclass that is handling the bridge */
+		AST_STRING_FIELD(subclass);
+		/*! Creator of the bridge */
+		AST_STRING_FIELD(creator);
+		/*! Name given to the bridge by its creator */
+		AST_STRING_FIELD(name);
+		/*! Unique ID of the channel providing video, if one exists */
+		AST_STRING_FIELD(video_source_id);
+	);
+	/*! AO2 container of bare channel uniqueid strings participating in the bridge.
+	 * Allocated from ast_str_container_alloc() */
+	struct ao2_container *channels;
+	/*! Bridge flags to tweak behavior */
+	struct ast_flags feature_flags;
+	/*! Bridge capabilities */
+	uint32_t capabilities;
+	/*! Number of channels participating in the bridge */
+	unsigned int num_channels;
+	/*! Number of active channels in the bridge. */
+	unsigned int num_active;
+	/*! The video mode of the bridge */
+	enum ast_bridge_video_mode_type video_mode;
+	/*! The time of bridge creation */
+	struct timeval creationtime;
+};
 
 /*!
  * \brief Structure that contains information about a bridge
@@ -307,7 +348,7 @@ struct ast_bridge {
 	/*! Private information unique to the bridge technology */
 	void *tech_pvt;
 	/*! Per-bridge topics */
-	struct stasis_cp_single *topics;
+	struct stasis_topic *topic;
 	/*! Call ID associated with the bridge */
 	ast_callid callid;
 	/*! Linked list of channels participating in the bridge */
@@ -353,10 +394,27 @@ struct ast_bridge {
 
 	/*! Type mapping used for media routing */
 	struct ast_vector_int media_types;
+	/*! Current bridge snapshot */
+	struct ast_bridge_snapshot *current_snapshot;
+	/*! The time of bridge creation */
+	struct timeval creationtime;
 };
 
 /*! \brief Bridge base class virtual method table. */
 extern struct ast_bridge_methods ast_bridge_base_v_table;
+
+/*!
+ * \brief Returns the global bridges container
+ * \since 17.0
+ *
+ * \retval a pointer to the bridges container success
+ * \retval NULL on failure
+ *
+ * \note You must use ao2_ref(<container>, -1) when done with it
+ *
+ * \warning You must not attempt to modify the container returned.
+ */
+struct ao2_container *ast_bridges(void);
 
 /*!
  * \brief Create a new base class bridge
@@ -984,6 +1042,20 @@ void ast_bridge_remove_video_src(struct ast_bridge *bridge, struct ast_channel *
  * \retval A string representation of \c video_mode
  */
 const char *ast_bridge_video_mode_to_string(enum ast_bridge_video_mode_type video_mode);
+
+/*!
+ * \brief Controls whether to send a "label" attribute in each stream in an SDP
+ * \since 16.1.0
+ *
+ * \param bridge The bridge
+ * \param send_sdp_label Whether to send the labels or not
+ *
+ * \note The label will contain the uniqueid of the channel related to the stream.
+ * This is used to allow the recipient to correlate the stream to the participant
+ * information events sent by app_confbridge.
+ * The bridge will be locked in this function.
+ */
+void ast_bridge_set_send_sdp_label(struct ast_bridge *bridge, unsigned int send_sdp_label);
 
 /*!
  * \brief Acquire the channel's bridge for transfer purposes.

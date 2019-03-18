@@ -20,7 +20,7 @@ void load_asterisk_conf(void);
 void set_asterisk_conf_path(const char *path);
 void set_socket_path(const char *path);
 
-int load_modules(unsigned int);		/*!< Provided by loader.c */
+int load_modules(void);		/*!< Provided by loader.c */
 int modules_shutdown(void);		/*!< Provided by loader.c */
 int load_pbx(void);			/*!< Provided by pbx.c */
 int load_pbx_builtins(void);	/*!< Provided by pbx_builtins.c */
@@ -56,6 +56,22 @@ int ast_msg_init(void);             /*!< Provided by message.c */
 void ast_msg_shutdown(void);        /*!< Provided by message.c */
 int aco_init(void);             /*!< Provided by config_options.c */
 int dns_core_init(void);        /*!< Provided by dns_core.c */
+
+/*!
+ * \brief Initialize malloc debug phase 1.
+ *
+ * \note Must be called first thing after forking.
+ *
+ * \return Nothing
+ */
+void load_astmm_phase_1(void);
+
+/*!
+ * \brief Initialize malloc debug phase 2.
+ *
+ * \return Nothing
+ */
+void load_astmm_phase_2(void);
 
 /*!
  * \brief Initialize the bridging system.

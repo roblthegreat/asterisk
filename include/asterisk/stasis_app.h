@@ -149,6 +149,17 @@ const char *stasis_app_name(const struct stasis_app *app);
 
 /*!
  * \brief Return the JSON representation of a Stasis application.
+ * \since 16.3.0
+ *
+ * \param app The application.
+ *
+ * \return JSON representation of app with given name.
+ * \return \c NULL on error.
+ */
+struct ast_json *stasis_app_object_to_json(struct stasis_app *app);
+
+/*!
+ * \brief Return the JSON representation of a Stasis application.
  *
  * \param app_name Name of the application.
  *
@@ -489,6 +500,20 @@ void stasis_app_control_clear_roles(struct stasis_app_control *control);
  * \return -1 for error.
  */
 int stasis_app_control_continue(struct stasis_app_control *control, const char *context, const char *extension, int priority);
+
+/*!
+ * \brief Exit \c res_stasis and move to another Stasis application.
+ *
+ * If the channel is no longer in \c res_stasis, this function does nothing.
+ *
+ * \param control Control for \c res_stasis
+ * \param app_name The name of the application to switch to
+ * \param app_args The list of arguments to pass to the application
+ *
+ * \return 0 for success
+ * \return -1 for error
+ */
+int stasis_app_control_move(struct stasis_app_control *control, const char *app_name, const char *app_args);
 
 /*!
  * \brief Redirect a channel in \c res_stasis to a particular endpoint
@@ -957,6 +982,41 @@ struct ast_cli_args;
  * \param a The CLI arguments
  */
 void stasis_app_to_cli(const struct stasis_app *app, struct ast_cli_args *a);
+
+/*!
+ * \brief Convert and add the app's event type filter(s) to the given json object.
+ *
+ * \param app The application
+ * \param json The json object to add the filter data to
+ *
+ * \return The given json object
+ */
+struct ast_json *stasis_app_event_filter_to_json(struct stasis_app *app, struct ast_json *json);
+
+/*!
+ * \brief Set the application's event type filter
+ *
+ * \param app The application
+ * \param filter The allowed and/or disallowed event filter
+ *
+ * \return 0 if successfully set
+ */
+int stasis_app_event_filter_set(struct stasis_app *app, struct ast_json *filter);
+
+/*!
+ * \brief Check if the given event should be filtered.
+ *
+ * Attempts first to find the event in the application's disallowed events list.
+ * If found then the event won't be sent to the remote. If not found in the
+ * disallowed list then a search is done to see if it can be found in the allowed
+ * list. If found the event message is sent, otherwise it is not sent.
+ *
+ * \param app_name The application name
+ * \param event The event to check
+ *
+ * \return True if allowed, false otherwise
+ */
+int stasis_app_event_allowed(const char *app_name, struct ast_json *event);
 
 /*! @} */
 

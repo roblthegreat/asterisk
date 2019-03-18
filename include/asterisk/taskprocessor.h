@@ -213,7 +213,8 @@ void *ast_taskprocessor_unreference(struct ast_taskprocessor *tps);
  * \retval -1 failure
  * \since 1.6.1
  */
-int ast_taskprocessor_push(struct ast_taskprocessor *tps, int (*task_exe)(void *datap), void *datap);
+int ast_taskprocessor_push(struct ast_taskprocessor *tps, int (*task_exe)(void *datap), void *datap)
+	attribute_warn_unused_result;
 
 /*! \brief Local data parameter */
 struct ast_taskprocessor_local {
@@ -239,7 +240,8 @@ struct ast_taskprocessor_local {
  * \since 12.0.0
  */
 int ast_taskprocessor_push_local(struct ast_taskprocessor *tps,
-	int (*task_exe)(struct ast_taskprocessor_local *local), void *datap);
+	int (*task_exe)(struct ast_taskprocessor_local *local), void *datap)
+	attribute_warn_unused_result;
 
 /*!
  * \brief Indicate the taskprocessor is suspended.
@@ -338,6 +340,19 @@ long ast_taskprocessor_size(struct ast_taskprocessor *tps);
  * \retval non-zero if some task processors are in high water alert.
  */
 unsigned int ast_taskprocessor_alert_get(void);
+
+
+/*!
+ * \brief Get the current taskprocessor high water alert count by sybsystem.
+ * \since 13.26.0
+ * \since 16.3.0
+ *
+ * \param subsystem The subsystem name
+ *
+ * \retval 0 if no taskprocessors are in high water alert.
+ * \retval non-zero if some task processors are in high water alert.
+ */
+unsigned int ast_taskprocessor_get_subsystem_alert(const char *subsystem);
 
 /*!
  * \brief Set the high and low alert water marks of the given taskprocessor queue.

@@ -134,6 +134,19 @@ static void *handle_tcptls_connection(void *data)
 		return NULL;
 	}
 
+	/*
+	 * TCP/TLS connections are associated with external protocols which can
+	 * be considered to be user interfaces (even for SIP messages), and
+	 * will not handle channel media.  This may need to be pushed down into
+	 * the individual protocol handlers, but this seems like a good start.
+	 */
+	if (ast_thread_user_interface_set(1)) {
+		ast_log(LOG_ERROR, "Failed to set user interface status; killing connection\n");
+		ast_tcptls_close_session_file(tcptls_session);
+		ao2_ref(tcptls_session, -1);
+		return NULL;
+	}
+
 	if (tcptls_session->parent->tls_cfg) {
 #ifdef DO_SSL
 		if (ast_iostream_start_tls(&tcptls_session->stream, tcptls_session->parent->tls_cfg->ssl_ctx, tcptls_session->client) < 0) {
@@ -733,7 +746,7 @@ void ast_tcptls_server_start(struct ast_tcptls_session_args *desc)
 		return;
 	}
 
-	desc->accept_fd = socket(ast_sockaddr_is_ipv6(&desc->local_address) ?
+	desc->accept_fd = ast_socket_nonblock(ast_sockaddr_is_ipv6(&desc->local_address) ?
 				 AF_INET6 : AF_INET, SOCK_STREAM, 0);
 	if (desc->accept_fd < 0) {
 		ast_log(LOG_ERROR, "Unable to allocate socket for %s: %s\n", desc->name, strerror(errno));
@@ -754,7 +767,6 @@ void ast_tcptls_server_start(struct ast_tcptls_session_args *desc)
 	}
 
 systemd_socket_activation:
-	ast_fd_set_flags(desc->accept_fd, O_NONBLOCK);
 	if (ast_pthread_create_background(&desc->master, NULL, desc->accept_fn, desc)) {
 		ast_log(LOG_ERROR, "Unable to launch thread for %s on %s: %s\n",
 			desc->name,

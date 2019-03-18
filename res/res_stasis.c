@@ -148,10 +148,10 @@ static struct ast_json *stasis_start_to_json(struct stasis_message *message,
 		return NULL;
 	}
 
-	msg = ast_json_pack("{s: s, s: o, s: o, s: o}",
+	msg = ast_json_pack("{s: s, s: O, s: O, s: o}",
 		"type", "StasisStart",
-		"timestamp", ast_json_copy(ast_json_object_get(payload->blob, "timestamp")),
-		"args", ast_json_deep_copy(ast_json_object_get(payload->blob, "args")),
+		"timestamp", ast_json_object_get(payload->blob, "timestamp"),
+		"args", ast_json_object_get(payload->blob, "args"),
 		"channel", ast_channel_snapshot_to_json(payload->channel, NULL));
 	if (!msg) {
 		ast_log(LOG_ERROR, "Failed to pack JSON for StasisStart message\n");
@@ -472,29 +472,6 @@ static int bridges_channel_sort_fn(const void *obj_left, const void *obj_right, 
 	return cmp;
 }
 
-/*! Removes the bridge to music on hold channel link */
-static void remove_bridge_moh(char *bridge_id)
-{
-	ao2_find(app_bridges_moh, bridge_id, OBJ_SEARCH_KEY | OBJ_UNLINK | OBJ_NODATA);
-	ast_free(bridge_id);
-}
-
-/*! After bridge failure callback for moh channels */
-static void moh_after_bridge_cb_failed(enum ast_bridge_after_cb_reason reason, void *data)
-{
-	char *bridge_id = data;
-
-	remove_bridge_moh(bridge_id);
-}
-
-/*! After bridge callback for moh channels */
-static void moh_after_bridge_cb(struct ast_channel *chan, void *data)
-{
-	char *bridge_id = data;
-
-	remove_bridge_moh(bridge_id);
-}
-
 /*! Request a bridge MOH channel */
 static struct ast_channel *prepare_bridge_moh_channel(void)
 {
@@ -517,10 +494,33 @@ static struct ast_channel *prepare_bridge_moh_channel(void)
 /*! Provides the moh channel with a thread so it can actually play its music */
 static void *moh_channel_thread(void *data)
 {
-	struct ast_channel *moh_channel = data;
+	struct stasis_app_bridge_channel_wrapper *moh_wrapper = data;
+	struct ast_channel *moh_channel = ast_channel_get_by_name(moh_wrapper->channel_id);
+	struct ast_frame *f;
 
-	while (!ast_safe_sleep(moh_channel, 1000)) {
+	if (!moh_channel) {
+		ao2_unlink(app_bridges_moh, moh_wrapper);
+		ao2_ref(moh_wrapper, -1);
+		return NULL;
 	}
+
+	/* Read and discard any frame coming from the stasis bridge. */
+	for (;;) {
+		if (ast_waitfor(moh_channel, -1) < 0) {
+			/* Error or hungup */
+			break;
+		}
+
+		f = ast_read(moh_channel);
+		if (!f) {
+			/* Hungup */
+			break;
+		}
+		ast_frfree(f);
+	}
+
+	ao2_unlink(app_bridges_moh, moh_wrapper);
+	ao2_ref(moh_wrapper, -1);
 
 	ast_moh_stop(moh_channel);
 	ast_hangup(moh_channel);
@@ -539,14 +539,9 @@ static void *moh_channel_thread(void *data)
  */
 static struct ast_channel *bridge_moh_create(struct ast_bridge *bridge)
 {
-	RAII_VAR(struct stasis_app_bridge_channel_wrapper *, new_wrapper, NULL, ao2_cleanup);
-	RAII_VAR(char *, bridge_id, ast_strdup(bridge->uniqueid), ast_free);
+	struct stasis_app_bridge_channel_wrapper *new_wrapper;
 	struct ast_channel *chan;
 	pthread_t threadid;
-
-	if (!bridge_id) {
-		return NULL;
-	}
 
 	chan = prepare_bridge_moh_channel();
 	if (!chan) {
@@ -557,14 +552,6 @@ static struct ast_channel *bridge_moh_create(struct ast_bridge *bridge)
 		ast_hangup(chan);
 		return NULL;
 	}
-
-	/* The after bridge callback assumes responsibility of the bridge_id. */
-	if (ast_bridge_set_after_callback(chan,
-		moh_after_bridge_cb, moh_after_bridge_cb_failed, bridge_id)) {
-		ast_hangup(chan);
-		return NULL;
-	}
-	bridge_id = NULL;
 
 	if (ast_unreal_channel_push_to_bridge(chan, bridge,
 		AST_BRIDGE_CHANNEL_FLAG_IMMOVABLE | AST_BRIDGE_CHANNEL_FLAG_LONELY)) {
@@ -579,21 +566,25 @@ static struct ast_channel *bridge_moh_create(struct ast_bridge *bridge)
 		return NULL;
 	}
 
-	if (ast_string_field_init(new_wrapper, 32)) {
+	if (ast_string_field_init(new_wrapper, AST_UUID_STR_LEN + AST_CHANNEL_NAME)
+		|| ast_string_field_set(new_wrapper, bridge_id, bridge->uniqueid)
+		|| ast_string_field_set(new_wrapper, channel_id, ast_channel_uniqueid(chan))) {
+		ao2_ref(new_wrapper, -1);
 		ast_hangup(chan);
 		return NULL;
 	}
-	ast_string_field_set(new_wrapper, bridge_id, bridge->uniqueid);
-	ast_string_field_set(new_wrapper, channel_id, ast_channel_uniqueid(chan));
 
 	if (!ao2_link_flags(app_bridges_moh, new_wrapper, OBJ_NOLOCK)) {
+		ao2_ref(new_wrapper, -1);
 		ast_hangup(chan);
 		return NULL;
 	}
 
-	if (ast_pthread_create_detached(&threadid, NULL, moh_channel_thread, chan)) {
+	/* Pass the new_wrapper ref to moh_channel_thread() */
+	if (ast_pthread_create_detached(&threadid, NULL, moh_channel_thread, new_wrapper)) {
 		ast_log(LOG_ERROR, "Failed to create channel thread. Abandoning MOH channel creation.\n");
 		ao2_unlink_flags(app_bridges_moh, new_wrapper, OBJ_NOLOCK);
+		ao2_ref(new_wrapper, -1);
 		ast_hangup(chan);
 		return NULL;
 	}
@@ -1028,7 +1019,7 @@ static int send_start_msg_snapshots(struct ast_channel *chan, struct stasis_app 
 	}
 
 	if (replace_channel_snapshot) {
-		app_unsubscribe_channel_id(app, replace_channel_snapshot->uniqueid);
+		app_unsubscribe_channel_id(app, replace_channel_snapshot->base->uniqueid);
 	}
 	stasis_publish(ast_app_get_topic(app), msg);
 	ao2_ref(msg, -1);
@@ -1333,7 +1324,17 @@ int stasis_app_exec(struct ast_channel *chan, const char *app_name, int argc,
 
 	control = control_create(chan, app);
 	if (!control) {
-		ast_log(LOG_ERROR, "Allocated failed\n");
+		ast_log(LOG_ERROR, "Control allocation failed or Stasis app '%s' not registered\n", app_name);
+		return -1;
+	}
+
+	if (!control_app(control)) {
+		ast_log(LOG_ERROR, "Stasis app '%s' not registered\n", app_name);
+		return -1;
+	}
+
+	if (!app_is_active(control_app(control))) {
+		ast_log(LOG_ERROR, "Stasis app '%s' not active\n", app_name);
 		return -1;
 	}
 	ao2_link(app_controls, control);
@@ -1343,7 +1344,7 @@ int stasis_app_exec(struct ast_channel *chan, const char *app_name, int argc,
 		return -1;
 	}
 
-	res = send_start_msg(app, chan, argc, argv);
+	res = send_start_msg(control_app(control), chan, argc, argv);
 	if (res != 0) {
 		ast_log(LOG_ERROR,
 			"Error sending start message to '%s'\n", app_name);
@@ -1366,15 +1367,138 @@ int stasis_app_exec(struct ast_channel *chan, const char *app_name, int argc,
 			break;
 		}
 
+		/* control->next_app is only modified within the control thread, so this is safe */
+		if (control_next_app(control)) {
+			struct stasis_app *next_app = ao2_find(apps_registry, control_next_app(control), OBJ_SEARCH_KEY);
+
+			if (next_app && app_is_active(next_app)) {
+				int idx;
+				int next_argc;
+				char **next_argv;
+
+				/* If something goes wrong in this conditional, res will need to be non-zero
+				 * so that the code below the exec loop knows something went wrong during a move.
+				 */
+				if (!stasis_app_channel_is_stasis_end_published(chan)) {
+					res = has_masquerade_store(chan) && app_send_end_msg(control_app(control), chan);
+					if (res != 0) {
+						ast_log(LOG_ERROR,
+							"Error sending end message to %s\n", stasis_app_name(control_app(control)));
+						control_mark_done(control);
+						ao2_ref(next_app, -1);
+						break;
+					}
+				} else {
+					remove_stasis_end_published(chan);
+				}
+
+				/* This will ao2_bump next_app, and unref the previous app by 1 */
+				control_set_app(control, next_app);
+
+				/* There's a chance that the previous application is ready for clean up, so go ahead
+				 * and do that now.
+				 */
+				cleanup();
+
+				/* We need to add another masquerade store, otherwise the leave message will
+				 * not show up for the correct application.
+				 */
+				if (add_masquerade_store(chan)) {
+					ast_log(LOG_ERROR, "Failed to attach masquerade detector\n");
+					res = -1;
+					control_mark_done(control);
+					ao2_ref(next_app, -1);
+					break;
+				}
+
+				/* We MUST get the size before the list, as control_next_app_args steals the elements
+				 * from the string vector.
+				 */
+				next_argc = control_next_app_args_size(control);
+				next_argv = control_next_app_args(control);
+
+				res = send_start_msg(control_app(control), chan, next_argc, next_argv);
+
+				/* Even if res != 0, we still need to free the memory we got from control_argv */
+				if (next_argv) {
+					for (idx = 0; idx < next_argc; idx++) {
+						ast_free(next_argv[idx]);
+					}
+					ast_free(next_argv);
+				}
+
+				if (res != 0) {
+					ast_log(LOG_ERROR,
+						"Error sending start message to '%s'\n", stasis_app_name(control_app(control)));
+					remove_masquerade_store(chan);
+					control_mark_done(control);
+					ao2_ref(next_app, -1);
+					break;
+				}
+
+				/* Done switching applications, free memory and clean up */
+				control_move_cleanup(control);
+			} else {
+				/* If we can't switch applications, do nothing */
+				struct ast_json *msg;
+				RAII_VAR(struct ast_channel_snapshot *, snapshot, NULL, ao2_cleanup);
+
+				if (!next_app) {
+					ast_log(LOG_ERROR, "Could not move to Stasis app '%s' - not registered\n",
+						control_next_app(control));
+				} else {
+					ast_log(LOG_ERROR, "Could not move to Stasis app '%s' - not active\n",
+						control_next_app(control));
+				}
+
+				snapshot = ast_channel_snapshot_get_latest(ast_channel_uniqueid(chan));
+				if (!snapshot) {
+					ast_log(LOG_ERROR, "Could not get channel shapshot for '%s'\n",
+						ast_channel_name(chan));
+				} else {
+					struct ast_json *json_args;
+					int next_argc = control_next_app_args_size(control);
+					char **next_argv = control_next_app_args(control);
+
+					msg = ast_json_pack("{s: s, s: o, s: s, s: []}",
+						"type", "ApplicationMoveFailed",
+						"channel", ast_channel_snapshot_to_json(snapshot, NULL),
+						"destination", control_next_app(control),
+						"args");
+					json_args = ast_json_object_get(msg, "args");
+					if (!json_args) {
+						ast_log(LOG_ERROR, "Could not get args json array");
+					} else {
+						int r = 0;
+						int idx;
+						for (idx = 0; idx < next_argc; ++idx) {
+							r = ast_json_array_append(json_args,
+								ast_json_string_create(next_argv[idx]));
+							if (r != 0) {
+								ast_log(LOG_ERROR, "Error appending to ApplicationMoveFailed message\n");
+								break;
+							}
+						}
+						if (r == 0) {
+							app_send(control_app(control), msg);
+						}
+					}
+					ast_json_unref(msg);
+				}
+			}
+			control_move_cleanup(control);
+			ao2_cleanup(next_app);
+		}
+
 		last_bridge = bridge;
 		bridge = ao2_bump(stasis_app_get_bridge(control));
 
 		if (bridge != last_bridge) {
 			if (last_bridge) {
-				app_unsubscribe_bridge(app, last_bridge);
+				app_unsubscribe_bridge(control_app(control), last_bridge);
 			}
 			if (bridge) {
-				app_subscribe_bridge(app, bridge);
+				app_subscribe_bridge(control_app(control), bridge);
 			}
 		}
 
@@ -1434,18 +1558,18 @@ int stasis_app_exec(struct ast_channel *chan, const char *app_name, int argc,
 	}
 
 	if (stasis_app_get_bridge(control)) {
-		app_unsubscribe_bridge(app, stasis_app_get_bridge(control));
+		app_unsubscribe_bridge(control_app(control), stasis_app_get_bridge(control));
 	}
 	ao2_cleanup(bridge);
 
 	/* Only publish a stasis_end event if it hasn't already been published */
-	if (!stasis_app_channel_is_stasis_end_published(chan)) {
+	if (!res && !stasis_app_channel_is_stasis_end_published(chan)) {
 		/* A masquerade has occurred and this message will be wrong so it
 		 * has already been sent elsewhere. */
-		res = has_masquerade_store(chan) && app_send_end_msg(app, chan);
+		res = has_masquerade_store(chan) && app_send_end_msg(control_app(control), chan);
 		if (res != 0) {
 			ast_log(LOG_ERROR,
-				"Error sending end message to %s\n", app_name);
+				"Error sending end message to %s\n", stasis_app_name(control_app(control)));
 			return res;
 		}
 	} else {
@@ -1465,12 +1589,10 @@ int stasis_app_exec(struct ast_channel *chan, const char *app_name, int argc,
 	/* The control needs to be removed from the controls container in
 	 * case a new PBX is started and ends up coming back into Stasis.
 	 */
-	ao2_cleanup(app);
-	app = NULL;
 	control_unlink(control);
 	control = NULL;
 
-	if (!ast_channel_pbx(chan)) {
+	if (!res && !ast_channel_pbx(chan)) {
 		int chan_hungup;
 
 		/* The ASYNCGOTO softhangup flag may have broken the channel out of
@@ -1698,13 +1820,14 @@ static struct ast_json *app_event_sources_to_json(
 	return json;
 }
 
-static struct ast_json *stasis_app_object_to_json(struct stasis_app *app)
+struct ast_json *stasis_app_object_to_json(struct stasis_app *app)
 {
 	if (!app) {
 		return NULL;
 	}
 
-	return app_event_sources_to_json(app, app_to_json(app));
+	return stasis_app_event_filter_to_json(
+		app, app_event_sources_to_json(app, app_to_json(app)));
 }
 
 struct ast_json *stasis_app_to_json(const char *app_name)
@@ -1983,7 +2106,7 @@ enum stasis_app_user_event_res stasis_app_user_event(const char *app_name,
 			have_channel = 1;
 		} else if (ast_begins_with(uri, "bridge:")) {
 			type = STASIS_UMOS_BRIDGE;
-			snapshot = ast_bridge_snapshot_get_latest(uri + 7);
+			snapshot = ast_bridge_get_snapshot_by_uniqueid(uri + 7);
 		} else if (ast_begins_with(uri, "endpoint:")) {
 			type = STASIS_UMOS_ENDPOINT;
 			snapshot = ast_endpoint_latest_snapshot(uri + 9, NULL);
@@ -2060,7 +2183,7 @@ static int unload_module(void)
 /* \brief Sanitization callback for channel snapshots */
 static int channel_snapshot_sanitizer(const struct ast_channel_snapshot *snapshot)
 {
-	if (!snapshot || !(snapshot->tech_properties & AST_CHAN_TP_INTERNAL)) {
+	if (!snapshot || !(snapshot->base->tech_properties & AST_CHAN_TP_INTERNAL)) {
 		return 0;
 	}
 	return 1;
@@ -2176,12 +2299,15 @@ static int load_module(void)
 	if (STASIS_MESSAGE_TYPE_INIT(end_message_type) != 0) {
 		return AST_MODULE_LOAD_DECLINE;
 	}
-	apps_registry = ao2_container_alloc(APPS_NUM_BUCKETS, app_hash, app_compare);
-	app_controls = ao2_container_alloc(CONTROLS_NUM_BUCKETS, control_hash, control_compare);
-	app_bridges = ao2_container_alloc(BRIDGES_NUM_BUCKETS, bridges_hash, bridges_compare);
+	apps_registry = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		APPS_NUM_BUCKETS, app_hash, NULL, app_compare);
+	app_controls = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		CONTROLS_NUM_BUCKETS, control_hash, NULL, control_compare);
+	app_bridges = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		BRIDGES_NUM_BUCKETS, bridges_hash, NULL, bridges_compare);
 	app_bridges_moh = ao2_container_alloc_hash(
-		AO2_ALLOC_OPT_LOCK_MUTEX, AO2_CONTAINER_ALLOC_OPT_DUPS_REJECT,
-		37, bridges_channel_hash_fn, bridges_channel_sort_fn, NULL);
+		AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		37, bridges_channel_hash_fn, NULL, NULL);
 	app_bridges_playback = ao2_container_alloc_hash(
 		AO2_ALLOC_OPT_LOCK_MUTEX, AO2_CONTAINER_ALLOC_OPT_DUPS_REJECT,
 		37, bridges_channel_hash_fn, bridges_channel_sort_fn, NULL);

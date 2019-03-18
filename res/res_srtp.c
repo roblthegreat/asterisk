@@ -30,6 +30,7 @@
 
 /*** MODULEINFO
 	<depend>srtp</depend>
+	<use type="external">openssl</use>
 	<support_level>core</support_level>
 ***/
 
@@ -193,7 +194,9 @@ static struct ast_srtp *res_srtp_new(void)
 		return NULL;
 	}
 
-	if (!(srtp->policies = ao2_t_container_alloc(5, policy_hash_fn, policy_cmp_fn, "SRTP policy container"))) {
+	srtp->policies = ao2_t_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, 5,
+		policy_hash_fn, NULL, policy_cmp_fn, "SRTP policy container");
+	if (!srtp->policies) {
 		ast_free(srtp);
 		return NULL;
 	}
@@ -979,8 +982,8 @@ static int res_sdp_crypto_parse_offer(struct ast_rtp_instance *rtp, struct ast_s
 				sdes_lifetime = n_lifetime;
 			}
 
-			/* Accept anything above 10 hours. Less than 10; reject. */
-			if (sdes_lifetime < 1800000) {
+			/* Accept anything above ~5.8 hours. Less than ~5.8; reject. */
+			if (sdes_lifetime < 1048576) {
 				ast_log(LOG_NOTICE, "Rejecting crypto attribute '%s': lifetime '%f' too short\n", attr, sdes_lifetime);
 				continue;
 			}
@@ -1014,7 +1017,6 @@ static int res_sdp_crypto_parse_offer(struct ast_rtp_instance *rtp, struct ast_s
 		}
 	} else if (!memcmp(crypto->remote_key, remote_key, key_len_from_sdp)) {
 		ast_debug(1, "SRTP remote key unchanged; maintaining current policy\n");
-		ast_set_flag(srtp, AST_SRTP_CRYPTO_OFFER_OK);
 		return 0;
 	}
 
@@ -1211,6 +1213,12 @@ static int res_srtp_init(void)
 		res_srtp_shutdown();
 		return -1;
 	}
+
+#ifdef HAVE_SRTP_GET_VERSION
+	ast_verb(2, "%s initialized\n", srtp_get_version_string());
+#else
+	ast_verb(2, "libsrtp initialized\n");
+#endif
 
 	g_initialized = 1;
 	return 0;

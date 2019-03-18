@@ -222,7 +222,8 @@ int aco_option_register_deprecated(struct aco_info *info, const char *name, stru
 		return -1;
 	}
 
-	if (!(opt = ao2_alloc(sizeof(*opt), config_option_destroy))) {
+	opt = ao2_alloc_options(sizeof(*opt), config_option_destroy, AO2_ALLOC_OPT_LOCK_NOLOCK);
+	if (!opt) {
 		return -1;
 	}
 
@@ -313,7 +314,9 @@ int __aco_option_register(struct aco_info *info, const char *name, enum aco_matc
 		return -1;
 	}
 
-	if (!(opt = ao2_alloc(sizeof(*opt) + argc * sizeof(opt->args[0]), config_option_destroy))) {
+	opt = ao2_alloc_options(sizeof(*opt) + argc * sizeof(opt->args[0]),
+		config_option_destroy, AO2_ALLOC_OPT_LOCK_NOLOCK);
+	if (!opt) {
 		return -1;
 	}
 
@@ -402,7 +405,8 @@ static struct aco_option *aco_option_find(struct aco_type *type, const char *nam
 
 struct ao2_container *aco_option_container_alloc(void)
 {
-	return ao2_container_alloc(CONFIG_OPT_BUCKETS, config_opt_hash, config_opt_cmp);
+	return ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, CONFIG_OPT_BUCKETS,
+		config_opt_hash, NULL, config_opt_cmp);
 }
 
 static int internal_aco_type_category_check(struct aco_type *match, const char *category)

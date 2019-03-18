@@ -179,30 +179,28 @@ int ast_endpoint_add_channel(struct ast_endpoint *endpoint,
 	return 0;
 }
 
-/*! \brief Handler for channel snapshot cache clears */
+/*! \brief Handler for channel snapshot update */
 static void endpoint_cache_clear(void *data,
 	struct stasis_subscription *sub,
 	struct stasis_message *message)
 {
 	struct ast_endpoint *endpoint = data;
-	struct stasis_message *clear_msg = stasis_message_data(message);
-	struct ast_channel_snapshot *clear_snapshot;
+	struct ast_channel_snapshot_update *update = stasis_message_data(message);
 
-	if (stasis_message_type(clear_msg) != ast_channel_snapshot_type()) {
+	/* Only when the channel is dead do we remove it */
+	if (!ast_test_flag(&update->new_snapshot->flags, AST_FLAG_DEAD)) {
 		return;
 	}
-
-	clear_snapshot = stasis_message_data(clear_msg);
 
 	ast_assert(endpoint != NULL);
 
 	ao2_lock(endpoint);
-	ast_str_container_remove(endpoint->channel_ids, clear_snapshot->uniqueid);
+	ast_str_container_remove(endpoint->channel_ids, update->new_snapshot->base->uniqueid);
 	ao2_unlock(endpoint);
 	endpoint_publish_snapshot(endpoint);
 }
 
-static void endpoint_default(void *data,
+static void endpoint_subscription_change(void *data,
 	struct stasis_subscription *sub,
 	struct stasis_message *message)
 {
@@ -257,22 +255,33 @@ static struct ast_endpoint *endpoint_internal_create(const char *tech, const cha
 	}
 
 	if (!ast_strlen_zero(resource)) {
+		char *topic_name;
+		int ret;
+
+		ret = ast_asprintf(&topic_name, "endpoint:%s", endpoint->id);
+		if (ret < 0) {
+			return NULL;
+		}
 
 		endpoint->topics = stasis_cp_single_create(ast_endpoint_cache_all(),
-			endpoint->id);
+			topic_name);
+		ast_free(topic_name);
 		if (!endpoint->topics) {
 			return NULL;
 		}
+		stasis_cp_single_accept_message_type(endpoint->topics, ast_endpoint_snapshot_type());
+		stasis_cp_single_set_filter(endpoint->topics, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 
 		endpoint->router = stasis_message_router_create_pool(ast_endpoint_topic(endpoint));
 		if (!endpoint->router) {
 			return NULL;
 		}
 		r |= stasis_message_router_add(endpoint->router,
-			stasis_cache_clear_type(), endpoint_cache_clear,
+			ast_channel_snapshot_type(), endpoint_cache_clear,
 			endpoint);
-		r |= stasis_message_router_set_default(endpoint->router,
-			endpoint_default, endpoint);
+		r |= stasis_message_router_add(endpoint->router,
+			stasis_subscription_change_type(), endpoint_subscription_change,
+			endpoint);
 		if (r) {
 			return NULL;
 		}
@@ -283,11 +292,22 @@ static struct ast_endpoint *endpoint_internal_create(const char *tech, const cha
 		endpoint_publish_snapshot(endpoint);
 		ao2_link(endpoints, endpoint);
 	} else {
+		char *topic_name;
+		int ret;
+
+		ret = ast_asprintf(&topic_name, "endpoint:%s", endpoint->id);
+		if (ret < 0) {
+			return NULL;
+		}
+
 		endpoint->topics = stasis_cp_sink_create(ast_endpoint_cache_all(),
-			endpoint->id);
+			topic_name);
+		ast_free(topic_name);
 		if (!endpoint->topics) {
 			return NULL;
 		}
+		stasis_cp_single_accept_message_type(endpoint->topics, ast_endpoint_snapshot_type());
+		stasis_cp_single_set_filter(endpoint->topics, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 
 		ao2_link(tech_endpoints, endpoint);
 	}
@@ -477,14 +497,14 @@ int ast_endpoint_init(void)
 {
 	ast_register_cleanup(endpoint_cleanup);
 
-	endpoints = ao2_container_alloc(ENDPOINT_BUCKETS, ast_endpoint_hash_fn,
-		ast_endpoint_cmp_fn);
+	endpoints = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, ENDPOINT_BUCKETS,
+		ast_endpoint_hash_fn, NULL, ast_endpoint_cmp_fn);
 	if (!endpoints) {
 		return -1;
 	}
 
-	tech_endpoints = ao2_container_alloc(TECH_ENDPOINT_BUCKETS, ast_endpoint_hash_fn,
-		ast_endpoint_cmp_fn);
+	tech_endpoints = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		TECH_ENDPOINT_BUCKETS, ast_endpoint_hash_fn, NULL, ast_endpoint_cmp_fn);
 	if (!tech_endpoints) {
 		return -1;
 	}

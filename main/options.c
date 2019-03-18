@@ -322,7 +322,9 @@ void load_asterisk_conf(void)
 			ast_set2_flag(&ast_options, ast_true(v->value), AST_OPT_FLAG_QUIET);
 		/* Run as console (-c at startup, implies nofork) */
 		} else if (!strcasecmp(v->name, "console")) {
-			ast_set2_flag(&ast_options, ast_true(v->value), AST_OPT_FLAG_NO_FORK | AST_OPT_FLAG_CONSOLE);
+			if (!ast_opt_remote) {
+				ast_set2_flag(&ast_options, ast_true(v->value), AST_OPT_FLAG_NO_FORK | AST_OPT_FLAG_CONSOLE);
+			}
 		/* Run with high priority if the O/S permits (-p at startup) */
 		} else if (!strcasecmp(v->name, "highpriority")) {
 			ast_set2_flag(&ast_options, ast_true(v->value), AST_OPT_FLAG_HIGH_PRIORITY);
@@ -355,13 +357,6 @@ void load_asterisk_conf(void)
 		/* Transmit SLINEAR silence while a channel is being recorded or DTMF is being generated on a channel */
 		} else if (!strcasecmp(v->name, "transmit_silence_during_record") || !strcasecmp(v->name, "transmit_silence")) {
 			ast_set2_flag(&ast_options, ast_true(v->value), AST_OPT_FLAG_TRANSMIT_SILENCE);
-		/* Enable internal timing */
-		} else if (!strcasecmp(v->name, "internal_timing")) {
-			if (!ast_opt_remote) {
-				fprintf(stderr,
-					"NOTICE: The internal_timing option is no longer needed.\n"
-					"  It will always be enabled if you have a timing module loaded.\n");
-			}
 		} else if (!strcasecmp(v->name, "mindtmfduration")) {
 			if (sscanf(v->value, "%30u", &option_dtmfminduration) != 1) {
 				option_dtmfminduration = AST_MIN_DTMF_DURATION;

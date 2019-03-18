@@ -385,6 +385,17 @@ AX_PTHREAD
 
 AC_LANG(C)
 
+PBX_NO_BINARY_MODULES=0
+AC_ARG_ENABLE([binary-modules],
+	[AS_HELP_STRING([--disable-binary-modules],
+		[Block installation of binary modules.])],
+	[case "${enableval}" in
+	      y|ye|yes) PBX_NO_BINARY_MODULES=0 ;;
+	      n|no)  PBX_NO_BINARY_MODULES=1 ;;
+	      *) AC_MSG_ERROR(bad value ${enableval} for --disable-binary-modules)  ;;
+	esac])
+AC_SUBST(PBX_NO_BINARY_MODULES)
+
 AC_ARG_ENABLE([dev-mode],
 	[AS_HELP_STRING([--enable-dev-mode],
 		[Turn on developer mode])],
@@ -423,6 +434,15 @@ AC_SUBST(AST_CODE_COVERAGE)
 AST_CHECK_RAII()
 AST_CHECK_STRSEP_ARRAY_BOUNDS()
 
+JANSSON_BUNDLED=no
+AC_ARG_WITH([jansson-bundled],
+	[AS_HELP_STRING([--with-jansson-bundled],
+		[Use bundled jansson library])],
+	[case "${withval}" in
+		y|yes) JANSSON_BUNDLED=yes ;;
+		*) JANSSON_BUNDLED=no ;;
+	esac])
+
 PJPROJECT_BUNDLED=yes
 AH_TEMPLATE(m4_bpatsubst([[HAVE_PJPROJECT_BUNDLED]], [(.*)]), [Define to 1 when using the bundled pjproject.])
 
@@ -460,7 +480,6 @@ AST_EXT_LIB_SETUP_OPTIONAL([COROSYNC_CFG_STATE_TRACK], [A callback only in coros
 AST_EXT_LIB_SETUP([CRYPT], [password and data encryption], [crypt])
 AST_EXT_LIB_SETUP([CRYPTO], [OpenSSL Cryptography], [crypto])
 AST_EXT_LIB_SETUP_OPTIONAL([OPENSSL_SRTP], [OpenSSL SRTP Extension Support], [CRYPTO], [crypto])
-AST_EXT_LIB_SETUP_OPTIONAL([OPENSSL_EC], [OpenSSL Elliptic Curve Support], [CRYPTO], [crypto])
 AST_EXT_LIB_SETUP([DAHDI], [DAHDI], [dahdi])
 AST_EXT_LIB_SETUP([FFMPEG], [Ffmpeg and avcodec], [avcodec])
 AST_EXT_LIB_SETUP([GSM], [External GSM], [gsm], [, use 'internal' GSM otherwise])
@@ -516,6 +535,10 @@ AST_EXT_LIB_SETUP_OPTIONAL([PJSIP_EVSUB_GRP_LOCK], [PJSIP EVSUB Group Lock suppo
 AST_EXT_LIB_SETUP_OPTIONAL([PJSIP_INV_SESSION_REF], [PJSIP INVITE Session Reference Count support], [PJPROJECT], [pjsip])
 AST_EXT_LIB_SETUP_OPTIONAL([PJSIP_AUTH_CLT_DEINIT], [pjsip_auth_clt_deinit support], [PJPROJECT], [pjsip])
 AST_EXT_LIB_SETUP_OPTIONAL([PJSIP_TSX_LAYER_FIND_TSX2], [pjsip_tsx_layer_find_tsx2 support], [PJPROJECT], [pjsip])
+AST_EXT_LIB_SETUP_OPTIONAL([PJSIP_INV_ACCEPT_MULTIPLE_SDP_ANSWERS], [PJSIP INVITE Accept Multiple SDP Answers], [PJPROJECT], [pjsip])
+AST_EXT_LIB_SETUP_OPTIONAL([PJSIP_ENDPOINT_COMPACT_FORM], [PJSIP Compact Form Support on Endpoint], [PJPROJECT], [pjsip])
+AST_EXT_LIB_SETUP_OPTIONAL([PJSIP_TRANSPORT_DISABLE_CONNECTION_REUSE], [PJSIP Transport Connection Reuse Disabling], [PJPROJECT], [pjsip])
+AST_EXT_LIB_SETUP_OPTIONAL([PJSIP_OAUTH_AUTHENTICATION], [PJSIP OAuth Authentication Support], [PJPROJECT], [pjsip])
 fi
 
 AST_EXT_LIB_SETUP([POPT], [popt], [popt])
@@ -564,6 +587,7 @@ AST_EXT_LIB_SETUP_OPTIONAL([SRTP_256], [SRTP Library AES-256 (ICM)], [SRTP], [sr
 AST_EXT_LIB_SETUP_OPTIONAL([SRTP_192], [SRTP Library AES-192 (ICM)], [SRTP], [srtp])
 AST_EXT_LIB_SETUP_OPTIONAL([SRTP_GCM], [SRTP Library AES-128 (GCM) and AES-256 (GCM)], [SRTP], [srtp])
 AST_EXT_LIB_SETUP_OPTIONAL([SRTP_SHUTDOWN], [SRTP Library Shutdown Function], [SRTP], [srtp])
+AST_EXT_LIB_SETUP_OPTIONAL([SRTP_GET_VERSION], [SRTP Library Version Function], [SRTP], [srtp])
 AST_EXT_LIB_SETUP([OPENSSL], [OpenSSL Secure Sockets Layer], [ssl])
 AST_EXT_LIB_SETUP_OPTIONAL([RT], [Realtime functions], [rt])
 AST_EXT_LIB_SETUP([SUPPSERV], [mISDN Supplemental Services], [suppserv])
@@ -616,6 +640,8 @@ AC_CHECK_HEADERS([ \
 
 AC_CHECK_HEADERS([arpa/inet.h libintl.h malloc.h netdb.h stddef.h strings.h sys/event.h utime.h])
 
+PKG_PROG_PKG_CONFIG()
+
 # Find required NetBSD Editline library (libedit).
 AST_PKG_CONFIG_CHECK(LIBEDIT, libedit)
 # some platforms do not list libedit via pkg-config, for example OpenBSD 6.2
@@ -652,11 +678,21 @@ fi
 AC_SUBST(UUID_INCLUDE)
 AC_SUBST(UUID_LIB)
 
-# Find required JSON support.
-AST_EXT_LIB_CHECK([JANSSON], [jansson], [json_dumps], [jansson.h])
+# Find required JSON support if bundled is not enabled.
+if test "$JANSSON_BUNDLED" = "no" ; then
+	AST_PKG_CONFIG_CHECK([JANSSON], [jansson >= 2.11])
+	# json_sprintf is available in 2.11+
+	AST_EXT_LIB_CHECK([JANSSON], [jansson], [json_sprintf], [jansson.h])
 
-if test "${PBX_JANSSON}" != 1; then
-  AC_MSG_ERROR([*** JSON support not found (this typically means the libjansson development package is missing)])
+	if test "${PBX_JANSSON}" != 1; then
+		AC_MSG_NOTICE(*** Asterisk requires libjansson >= 2.11 and no system copy was found.)
+		AC_MSG_NOTICE(*** Please install the 'libjansson' development package or)
+		AC_MSG_NOTICE(*** use './configure --with-jansson-bundled')
+		exit 1
+	fi
+	JANSSON_DEFINE_JSON_INT()
+else
+	PBX_JANSSON=1
 fi
 
 # See if clock_gettime is in librt
@@ -750,7 +786,7 @@ AC_FUNC_STRNLEN
 AC_FUNC_STRTOD
 AC_FUNC_UTIME_NULL
 AC_FUNC_VPRINTF
-AC_CHECK_FUNCS([asprintf atexit closefrom dup2 eaccess endpwent euidaccess ffsll ftruncate getcwd gethostbyname gethostname getloadavg gettimeofday glob ioperm inet_ntoa isascii memchr memmove memset mkdir mkdtemp munmap newlocale ppoll putenv re_comp regcomp select setenv socket strcasecmp strcasestr strchr strcspn strdup strerror strlcat strlcpy strncasecmp strndup strnlen strrchr strsep strspn strstr strtod strtol strtold strtoq unsetenv uselocale utime vasprintf getpeereid sysctl swapctl])
+AC_CHECK_FUNCS([asprintf atexit closefrom dup2 eaccess endpwent euidaccess ffsll ftruncate getcwd gethostbyname gethostname getloadavg gettimeofday glob ioperm inet_ntoa isascii memchr memmove memset mkdir mkdtemp munmap newlocale pipe2 ppoll putenv re_comp regcomp select setenv socket strcasecmp strcasestr strchr strcspn strdup strerror strlcat strlcpy strncasecmp strndup strnlen strrchr strsep strspn strstr strtod strtol strtold strtoq unsetenv uselocale utime vasprintf getpeereid sysctl swapctl malloc_trim])
 
 AC_MSG_CHECKING(for htonll)
 AC_LINK_IFELSE(
@@ -1088,6 +1124,27 @@ AC_RUN_IFELSE(
 	AC_MSG_RESULT(no),
 	# It's unlikely an embedded system will have this.
 	AC_MSG_RESULT(unknown)
+)
+
+AC_MSG_CHECKING([if socket() accepts SOCK_NONBLOCK])
+AC_RUN_IFELSE(
+[AC_LANG_PROGRAM([
+	#ifdef HAVE_SYS_TYPES_H
+	# include <sys/types.h>
+	#endif
+	#ifdef HAVE_SYS_SOCKET_H
+	# include <sys/socket.h>
+	#endif
+	], [
+	   if (socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0) < 0) {
+	      return 1;
+	   }
+	   return 0;
+	])],
+	AC_MSG_RESULT(yes)
+	AC_DEFINE([HAVE_SOCK_NONBLOCK], 1, [Define to 1 if your socket() implementation can accept SOCK_NONBLOCK.]),
+	AC_MSG_RESULT(no),
+	AC_MSG_RESULT(cross-compile)
 )
 
 AC_MSG_CHECKING(if we can increase the maximum select-able file descriptor)
@@ -1474,9 +1531,6 @@ if test "${PBX_DLADDR}" = "0"; then
 		AC_MSG_RESULT(no)
 	)
 fi
-
-# PKGCONFIG is used in later tests
-PKG_PROG_PKG_CONFIG()
 
 
 # do the package library checks now
@@ -2230,15 +2284,17 @@ AST_EXT_TOOL_CHECK([NETSNMP], [net-snmp-config], , [--agent-libs],
 
 AST_EXT_LIB_CHECK([NEWT], [newt], [newtBell], [newt.h])
 
-# libunbound v1.5.0 added the ub_ctx_add_ta_autr() API call that we can
-# detect as a useable version so that is going to be the minimum version
-# that we will require.
-# Technically v1.4.21 and later could be used but v1.4.21 has a configure
-# script bug which does not find the ldns library.  The bug is fixed in
-# v1.4.22 but that version is not easily detectable.
-#
-AST_EXT_LIB_CHECK([UNBOUND], [unbound], [ub_ctx_delete], [unbound.h])
-AST_C_DECLARE_CHECK([UNBOUND_CONST_PARAMS], [UNBOUND_VERSION_MAJOR], [unbound.h])
+# Check that unbound is installed and the version code fragment compiles
+AST_EXT_LIB_EXTRA_CHECK([UNBOUND], [unbound], [ub_ctx_delete], [unbound.h],
+   [], [], [
+      AC_LANG_PROGRAM( [#include <unbound.h>],
+         [
+            #if (UNBOUND_VERSION_MAJOR < 1 || (UNBOUND_VERSION_MAJOR == 1 && UNBOUND_VERSION_MINOR < 5 ))
+            #error "Unbound version must be >= 1.5"
+            #endif
+         ]
+      )
+   ], [unbound version >= 1.5])
 
 AST_EXT_LIB_CHECK([UNIXODBC], [odbc], [SQLConnect], [sql.h])
 
@@ -2341,6 +2397,10 @@ if test "$USE_PJPROJECT" != "no" ; then
       CPPFLAGS="${CPPFLAGS} ${PJPROJECT_CFLAGS}"
       LIBS="${LIBS} ${PJPROJECT_LIB}"
       AST_C_COMPILE_CHECK([PJSIP_TLS_TRANSPORT_PROTO], [struct pjsip_tls_setting setting; int proto; proto = setting.proto;], [pjsip.h])
+      AST_C_COMPILE_CHECK([PJSIP_INV_ACCEPT_MULTIPLE_SDP_ANSWERS], [pjsip_cfg()->endpt.accept_multiple_sdp_answers = 0;], [pjsip.h])
+      AST_C_COMPILE_CHECK([PJSIP_ENDPOINT_COMPACT_FORM], [pjsip_cfg()->endpt.use_compact_form = PJ_TRUE;], [pjsip.h])
+      AST_C_COMPILE_CHECK([PJSIP_TRANSPORT_DISABLE_CONNECTION_REUSE], [struct pjsip_tpselector sel; sel.disable_connection_reuse = PJ_TRUE;], [pjsip.h])
+      AST_C_COMPILE_CHECK([PJSIP_OAUTH_AUTHENTICATION], [struct pjsip_oauth_credential credential;], [pjsip.h])
       LIBS="${saved_libs}"
       CPPFLAGS="${saved_cppflags}"
 
@@ -2388,7 +2448,7 @@ AST_EXT_LIB_CHECK([PRI_REVERSE_CHARGE], [pri], [pri_sr_set_reversecharge], [libp
 # ------------------------------------^
 
 AST_EXT_LIB_CHECK([RESAMPLE], [resample], [resample_open], [libresample.h], [-lm])
-AST_EXT_LIB_CHECK([FFTW3], [fftw3], [fftw_alloc_real], [fftw3.h])
+AST_EXT_LIB_CHECK([FFTW3], [fftw3], [fftw_malloc], [fftw3.h])
 AST_EXT_LIB_CHECK([SNDFILE], [sndfile], [sf_open], [sndfile.h])
 
 AST_C_COMPILE_CHECK([SPANDSP], [
@@ -2519,12 +2579,6 @@ fi
 if test "$PBX_OPENSSL" = "1";
 then
         AST_CHECK_OSPTK([4], [0], [0])
-        AST_EXT_LIB_CHECK([OPENSSL_SRTP], [ssl], [SSL_CTX_set_tlsext_use_srtp], [openssl/ssl.h], [-lcrypto])
-fi
-
-if test "$PBX_OPENSSL" = "1";
-then
-	AST_EXT_LIB_CHECK([OPENSSL_EC], [ssl], [EC_KEY_new_by_curve_name], [openssl/ec.h], [-lcrypto])
 fi
 
 AST_EXT_LIB_CHECK([SRTP], [srtp2], [srtp_init], [srtp2/srtp.h], [], [], [2])
@@ -2550,6 +2604,7 @@ then
     AST_EXT_LIB_CHECK([SRTP_192], [srtp2], [srtp_crypto_policy_set_aes_cm_192_hmac_sha1_80])
     AST_EXT_LIB_CHECK([SRTP_GCM], [srtp2], [srtp_crypto_policy_set_aes_gcm_128_8_auth])
     AST_EXT_LIB_CHECK([SRTP_SHUTDOWN], [srtp2], [srtp_shutdown], [srtp2/srtp.h])
+    AST_EXT_LIB_CHECK([SRTP_GET_VERSION], [srtp2], [srtp_get_version_string], [srtp2/srtp.h])
 
     # libsrtp2 removed support for PRNG, so we require OpenSSL
     if test "x$PBX_OPENSSL" != x1;
@@ -2584,6 +2639,7 @@ then
         AST_EXT_LIB_CHECK([SRTP_192], [srtp], [crypto_policy_set_aes_cm_192_hmac_sha1_80])
         AST_EXT_LIB_CHECK([SRTP_GCM], [srtp], [crypto_policy_set_aes_gcm_128_8_auth])
         AST_EXT_LIB_CHECK([SRTP_SHUTDOWN], [srtp], [srtp_shutdown], [srtp/srtp.h])
+        AST_EXT_LIB_CHECK([SRTP_GET_VERSION], [srtp], [srtp_get_version_string], [srtp/srtp.h])
     fi
 fi
 
@@ -2759,7 +2815,10 @@ else
 fi
 
 # conf_bridge (binaural rendering): check if HRIRs are available
-AC_CHECK_FILES([bridges/bridge_softmix/include/hrirs.h])
+# this check does not work when cross-compiling
+if test "${cross_compiling}" = "no"; then
+    AC_CHECK_FILES([bridges/bridge_softmix/include/hrirs.h])
+fi
 
 AC_CONFIG_FILES([build_tools/menuselect-deps makeopts])
 AST_CHECK_MANDATORY

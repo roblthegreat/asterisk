@@ -54,18 +54,13 @@ ifeq ($(SPECIAL_TARGETS),)
         include source/build.mak
         CF := $(filter-out -W%,$(CC_CFLAGS))
         CF := $(filter-out -I%,$(CF))
-        ifeq ($(findstring TEST_FRAMEWORK,$(MENUSELECT_CFLAGS)),TEST_FRAMEWORK)
+        ifeq ($(AST_DEVMODE),yes)
             apps := source/pjsip-apps/bin/pjsua-$(TARGET_NAME) source/pjsip-apps/bin/pjsystest-$(TARGET_NAME)
             TARGETS += $(apps)
             ifneq ($(PYTHONDEV_LIB),)
                 TARGETS += source/pjsip-apps/src/python/_pjsua.so
             endif
-        endif
-        ifeq ($(AST_DEVMODE),yes)
             CF += -DPJPROJECT_BUNDLED_ASSERTIONS=yes
-        endif
-        ifeq ($(findstring MALLOC_DEBUG,$(MENUSELECT_CFLAGS)),MALLOC_DEBUG)
-            CF += -DMALLOC_DEBUG
         endif
         MALLOC_DEBUG_LIBS = source/pjsip-apps/lib/libasterisk_malloc_debug.a
         MALLOC_DEBUG_LDFLAGS = -L$(PJDIR)/pjsip-apps/lib -Wl,-whole-archive -lasterisk_malloc_debug -Wl,-no-whole-archive
@@ -89,49 +84,22 @@ SHELL_ECHO_PREFIX := echo '[pjproject] '
 
 _all: $(TARGETS)
 
-define tarball_exists
-	(if [ -f $(TARBALL) -a -f $(PJMD5SUM) ] ; then exit 0 ;\
-	else exit 1; fi; )
-endef
-
-define verify_tarball
-	($(SHELL_ECHO_PREFIX) Verifying $(TARBALL) &&\
-	tarball_sum=$$($(CAT) $(TARBALL) | $(MD5) | $(CUT) -d' ' -f1) ;\
-	required_sum=$$($(GREP) -e $(TARBALL_FILE) $(PJMD5SUM) | $(CUT) -d' ' -f1) ;\
-	if [ -z "$$required_sum" -o "$$tarball_sum" != "$$required_sum" ] ; then $(SHELL_ECHO_PREFIX) Verify failed ; exit 1 ;\
-	else $(SHELL_ECHO_PREFIX) Verify successful ; exit 0 ; fi; )
-endef
-
-define download_from_pjproject
-	($(SHELL_ECHO_PREFIX) Downloading $(TARBALL_URL) to $(TARBALL) ;\
-	$(DOWNLOAD_TO_STDOUT) $(call DOWNLOAD_TIMEOUT,5,60) $(TARBALL_URL) > $(TARBALL) &&\
-	$(SHELL_ECHO_PREFIX) Downloading $(PJPROJECT_URL)/MD5SUM.TXT to $(PJMD5SUM) &&\
-	$(DOWNLOAD_TO_STDOUT) $(call DOWNLOAD_TIMEOUT,5,60) $(PJPROJECT_URL)/MD5SUM.TXT > $(PJMD5SUM) &&\
-	$(verify_tarball))
-endef
-
 .DELETE_ON_ERROR:
 
-DOWNLOAD_DIR := $(or $(EXTERNALS_CACHE_DIR),$(TMPDIR),$(wildcard /tmp),.)
-TARBALL_FILE = pjproject-$(PJPROJECT_VERSION).tar.bz2
-TARBALL = $(DOWNLOAD_DIR)/$(TARBALL_FILE)
-TARBALL_URL = $(PJPROJECT_URL)/$(TARBALL_FILE)
-PJMD5SUM = $(patsubst %.tar.bz2,%.md5,$(TARBALL))
+$(DOWNLOAD_DIR)/$(TARBALL_FILE): ../versions.mak
+	$(CMD_PREFIX) ($(TARBALL_EXISTS) && $(TARBALL_VERIFY) && touch $@) || (rm -rf $@ ;\
+	$(TARBALL_DOWNLOAD)) || (rm -rf $@ ;\
+	$(SHELL_ECHO_PREFIX) Retrying download ; $(TARBALL_DOWNLOAD))
 
-$(TARBALL): ../versions.mak
-	$(CMD_PREFIX) ($(tarball_exists) && $(verify_tarball) && touch $@) || (rm -rf $@ ;\
-	$(download_from_pjproject)) || (rm -rf $@ ;\
-	$(SHELL_ECHO_PREFIX) Retrying download ; $(download_from_pjproject))
-
-source/.unpacked: $(DOWNLOAD_DIR)/pjproject-$(PJPROJECT_VERSION).tar.bz2
-	$(CMD_PREFIX) $(verify_tarball) || (rm -rf $@ ;\
-	$(SHELL_ECHO_PREFIX) Retrying download ; $(download_from_pjproject))
+source/.unpacked: $(DOWNLOAD_DIR)/$(TARBALL_FILE)
+	$(CMD_PREFIX) $(TARBALL_VERIFY) || (rm -rf $@ ;\
+	$(SHELL_ECHO_PREFIX) Retrying download ; $(TARBALL_DOWNLOAD))
 	$(ECHO_PREFIX) Unpacking $<
-	-@rm -rf source pjproject-* >/dev/null 2>&1
+	-@rm -rf source pjproject-*/ >/dev/null 2>&1
 	$(CMD_PREFIX) $(TAR) -xjf $<
 	@mv pjproject-$(PJPROJECT_VERSION) source
 	$(ECHO_PREFIX) Applying patches "$(realpath patches)" "$(realpath .)/source"
-	$(CMD_PREFIX) ./apply_patches $(QUIET_CONFIGURE) "$(realpath patches)" "$(realpath .)/source"
+	$(CMD_PREFIX) ../apply_patches $(QUIET_CONFIGURE) "$(realpath patches)" "$(realpath .)/source"
 	-@touch source/.unpacked
 
 source/version.mak: source/.unpacked
@@ -158,8 +126,11 @@ build.mak: source/build.mak
 
 configure: source/build.mak
 
+# We need to filter-out any -O and -g options in PJ_CFLAGS before echoing out
+# the result so Asterisk modules don't have the optimization and symbolic debug
+# options overridden by the PJPROJECT configure script selected settings.
 echo_cflags: source/build.mak
-	@echo $(PJ_CFLAGS)
+	@echo $(filter-out -O% -g%,$(PJ_CFLAGS))
 
 libpj%.a: source/build.mak
 	$(ECHO_PREFIX) Compiling lib $(@F)

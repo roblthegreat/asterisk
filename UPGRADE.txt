@@ -22,50 +22,70 @@
 === UPGRADE-13.txt  -- Upgrade info for 12 to 13
 === UPGRADE-14.txt  -- Upgrade info for 13 to 14
 === UPGRADE-15.txt  -- Upgrade info for 14 to 15
+=== UPGRADE-16.txt  -- Upgrade info for 15 to 16
 ===========================================================
 
-New in 16.0.0:
+New in 17.0.0:
 
-app_fax:
- - The app_fax module is now deprecated, users should migrate to the
-   replacement module res_fax.
+chan_sip:
+ - The chan_sip module is now deprecated, users should migrate to the
+   replacement module chan_pjsip.  See guides at the Asterisk Wiki:
+     https://wiki.asterisk.org/wiki/x/tAHOAQ
+     https://wiki.asterisk.org/wiki/x/hYCLAQ
 
-app_macro:
- - The app_macro module is now deprecated and by default it is no longer
-   built.  Users should migrate to app_stack (Gosub).  A warning is logged
-   the first time any Macro is used.
+func_callerid:
+ - The CALLERPRES() dialplan function, deprecated in Asterisk 1.8, has been
+   removed.
 
-AMI:
- - The ContactStatus and Status fields for the manager events ContactStatus
-   and ContactStatusDetail are now set to "NonQualified" when a contact exists
-   but has not been qualified.
+res_parking:
+ - The PARKINGSLOT channel variable, deprecated in Asterisk 12 in favor of the
+   PARKING_SPACE channel variable, will no longer be set.
 
-ARI:
- - The ContactInfo event's contact_status field is now set to "NonQualified"
-   when a contact exists but has not been qualified.
+res_xmpp:
+ - The JabberStatus application, deprecated in Asterisk 12, has been removed.
 
-Build System:
- - MALLOC_DEBUG no longer has an effect on Asterisk's ABI.  Asterisk built
-   with MALLOC_DEBUG can now successfully load binary modules built without
-   MALLOC_DEBUG and vice versa.  Third-party pre-compiled modules no longer
-   need to have a special build with it enabled.
+Channels:
+ - The core no longer uses the stasis cache for channels snapshots.
+   The following APIs are no longer available:
+       ast_channel_topic_cached()
+       ast_channel_topic_all_cached()
+   The ast_channel_cache_all() and ast_channel_cache_by_name() functions
+   now returns an ao2_container of ast_channel_snapshots rather than a
+   container of stasis_messages therefore you can't call stasis_cache
+   functions on it.
+   The ast_channel_topic_all() function now returns a normal topic,
+   not a cached one so you can't use stasis cache functions on it either.
+   The ast_channel_snapshot_type() stasis message now has the
+   ast_channel_snapshot_update structure as it's data.
+   ast_channel_snapshot_get_latest() still returns the latest snapshot.
 
-chan_dahdi:
- - Timeouts for reading digits from analog phones are now configurable in
-   chan_dahdi.conf: firstdigit_timeout, interdigit_timeout, matchdigit_timeout.
+Applications
+ - The JabberStatus application, deprecated in Asterisk 12, has been removed.
 
-cdr_syslog:
- - The cdr_syslog module is now deprecated and by default it is no longer
-   built.
+Bridging
+ - The bridging core no longer uses the stasis cache for bridge
+   snapshots.  The latest bridge snapshot is now stored on the
+   ast_bridge structure itself.
+ - The following APIs are no longer available since the stasis cache
+   is no longer used:
+     ast_bridge_topic_cached()
+     ast_bridge_topic_all_cached()
+ - A topic pool is now used for individual bridge topics.
+ - The ast_bridge_cache() function was removed since there's no
+   longer a separate container of snapshots.
+ - A new function "ast_bridges()" was created to retrieve the
+   container of all bridges.  Users formerly calling
+   ast_bridge_cache() can use the new function to iterate over
+   bridges and retrieve the latest snapshot directly from the
+   bridge.
+ - The ast_bridge_snapshot_get_latest() function was renamed to
+   ast_bridge_get_snapshot_by_uniqueid().
+ - A new function "ast_bridge_get_snapshot()" was created to retrieve
+   the bridge snapshot directly from the bridge structure.
+ - The ast_bridge_topic_all() function now returns a normal topic
+   not a cached one so you can't use stasis cache functions on it
+   either.
+ - The ast_bridge_snapshot_type() stasis message now has the
+   ast_bridge_snapshot_update structure as it's data.  It contains
+   the last snapshot and the new one.
 
-res_config_sqlite:
- - The res_config_sqlite module is now deprecated, users should migrate to the
-   replacement module res_config_sqlite3.
-
-res_monitor:
- - The res_monitor module is now deprecated, users should migrate to the
-   replacement module app_mixmonitor.
-
-Core:
- - libedit is no longer available as an embedded library and must be provided
-   by the system.

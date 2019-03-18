@@ -82,9 +82,16 @@
 
 /*! Maximum application/json or application/x-www-form-urlencoded body content length. */
 #if !defined(LOW_MEMORY)
-#define MAX_CONTENT_LENGTH 4096
+#define MAX_CONTENT_LENGTH 40960
 #else
 #define MAX_CONTENT_LENGTH 1024
+#endif	/* !defined(LOW_MEMORY) */
+
+/*! Initial response body length. */
+#if !defined(LOW_MEMORY)
+#define INITIAL_RESPONSE_BODY_BUFFER 1024
+#else
+#define INITIAL_RESPONSE_BODY_BUFFER 512
 #endif	/* !defined(LOW_MEMORY) */
 
 /*! Maximum line length for HTTP requests. */
@@ -557,7 +564,7 @@ void ast_http_create_response(struct ast_tcptls_session_instance *ser, int statu
 {
 	char server_name[MAX_SERVER_NAME_LENGTH];
 	struct ast_str *server_address = ast_str_create(MAX_SERVER_NAME_LENGTH);
-	struct ast_str *out = ast_str_create(MAX_CONTENT_LENGTH);
+	struct ast_str *out = ast_str_create(INITIAL_RESPONSE_BODY_BUFFER);
 
 	if (!http_header_data || !server_address || !out) {
 		ast_free(http_header_data);
@@ -916,14 +923,24 @@ void ast_http_body_read_status(struct ast_tcptls_session_instance *ser, int read
 static int http_body_read_contents(struct ast_tcptls_session_instance *ser, char *buf, int length, const char *what_getting)
 {
 	int res;
+	int total = 0;
 
 	/* Stream is in exclusive mode so we get it all if possible. */
-	res = ast_iostream_read(ser->stream, buf, length);
-	if (res < length) {
-		ast_log(LOG_WARNING, "Short HTTP request %s (Wanted %d)\n",
-			what_getting, length);
+	while (total != length) {
+		res = ast_iostream_read(ser->stream, buf + total, length - total);
+		if (res <= 0) {
+			break;
+		}
+
+		total += res;
+	}
+
+	if (total != length) {
+		ast_log(LOG_WARNING, "Wrong HTTP content read. Request %s (Wanted %d, Read %d)\n",
+			what_getting, length, res);
 		return -1;
 	}
+
 	return 0;
 }
 
@@ -1740,11 +1757,19 @@ static int http_request_headers_get(struct ast_tcptls_session_instance *ser, str
 
 	remaining_headers = MAX_HTTP_REQUEST_HEADERS;
 	for (;;) {
+		ssize_t len;
 		char *name;
 		char *value;
 
-		if (ast_iostream_gets(ser->stream, header_line, sizeof(header_line)) <= 0) {
+		len = ast_iostream_gets(ser->stream, header_line, sizeof(header_line));
+		if (len <= 0) {
 			ast_http_error(ser, 400, "Bad Request", "Timeout");
+			return -1;
+		}
+		if (header_line[len - 1] != '\n') {
+			/* We didn't get a full line */
+			ast_http_error(ser, 400, "Bad Request",
+				(len == sizeof(header_line) - 1) ? "Header line too long" : "Timeout");
 			return -1;
 		}
 
@@ -1815,15 +1840,24 @@ static int httpd_process_request(struct ast_tcptls_session_instance *ser)
 	struct http_worker_private_data *request;
 	enum ast_http_method http_method = AST_HTTP_UNKNOWN;
 	int res;
+	ssize_t len;
 	char request_line[MAX_HTTP_LINE_LENGTH];
 
-	if (ast_iostream_gets(ser->stream, request_line, sizeof(request_line)) <= 0) {
+	len = ast_iostream_gets(ser->stream, request_line, sizeof(request_line));
+	if (len <= 0) {
 		return -1;
 	}
 
 	/* Re-initialize the request body tracking data. */
 	request = ser->private_data;
 	http_request_tracking_init(request);
+
+	if (request_line[len - 1] != '\n') {
+		/* We didn't get a full line */
+		ast_http_error(ser, 400, "Bad Request",
+			(len == sizeof(request_line) - 1) ? "Request line too long" : "Timeout");
+		return -1;
+	}
 
 	/* Get method */
 	method = ast_skip_blanks(request_line);
@@ -2049,7 +2083,15 @@ static int __ast_http_load(int reload)
 	int http_tls_was_enabled = 0;
 
 	cfg = ast_config_load2("http.conf", "http", config_flags);
-	if (!cfg || cfg == CONFIG_STATUS_FILEUNCHANGED || cfg == CONFIG_STATUS_FILEINVALID) {
+	if (!cfg || cfg == CONFIG_STATUS_FILEINVALID) {
+		return 0;
+	}
+
+	/* Even if the http.conf hasn't been updated, the TLS certs/keys may have been */
+	if (cfg == CONFIG_STATUS_FILEUNCHANGED) {
+		if (http_tls_cfg.enabled && ast_ssl_setup(https_desc.tls_cfg)) {
+			ast_tcptls_server_start(&https_desc);
+		}
 		return 0;
 	}
 
@@ -2314,4 +2356,5 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_
 	.unload = unload_module,
 	.reload = reload_module,
 	.load_pri = AST_MODPRI_CORE,
+	.requires = "extconfig",
 );

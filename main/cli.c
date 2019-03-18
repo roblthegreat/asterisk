@@ -956,7 +956,7 @@ static char *handle_chanlist(struct ast_cli_entry *e, int cmd, struct ast_cli_ar
 
 	struct ao2_container *channels;
 	struct ao2_iterator it_chans;
-	struct stasis_message *msg;
+	struct ast_channel_snapshot *cs;
 	int numchans = 0, concise = 0, verbose = 0, count = 0;
 
 	switch (cmd) {
@@ -989,11 +989,7 @@ static char *handle_chanlist(struct ast_cli_entry *e, int cmd, struct ast_cli_ar
 	} else if (a->argc != e->args - 1)
 		return CLI_SHOWUSAGE;
 
-
-	if (!(channels = stasis_cache_dump(ast_channel_cache_by_name(), ast_channel_snapshot_type()))) {
-		ast_cli(a->fd, "Failed to retrieve cached channels\n");
-		return CLI_SUCCESS;
-	}
+	channels = ast_channel_cache_by_name();
 
 	if (!count) {
 		if (!concise && !verbose)
@@ -1004,13 +1000,12 @@ static char *handle_chanlist(struct ast_cli_entry *e, int cmd, struct ast_cli_ar
 	}
 
 	it_chans = ao2_iterator_init(channels, 0);
-	for (; (msg = ao2_iterator_next(&it_chans)); ao2_ref(msg, -1)) {
-		struct ast_channel_snapshot *cs = stasis_message_data(msg);
+	for (; (cs = ao2_iterator_next(&it_chans)); ao2_ref(cs, -1)) {
 		char durbuf[16] = "-";
 
 		if (!count) {
-			if ((concise || verbose)  && !ast_tvzero(cs->creationtime)) {
-				int duration = (int)(ast_tvdiff_ms(ast_tvnow(), cs->creationtime) / 1000);
+			if ((concise || verbose)  && !ast_tvzero(cs->base->creationtime)) {
+				int duration = (int)(ast_tvdiff_ms(ast_tvnow(), cs->base->creationtime) / 1000);
 				if (verbose) {
 					int durh = duration / 3600;
 					int durm = (duration % 3600) / 60;
@@ -1021,36 +1016,36 @@ static char *handle_chanlist(struct ast_cli_entry *e, int cmd, struct ast_cli_ar
 				}
 			}
 			if (concise) {
-				ast_cli(a->fd, CONCISE_FORMAT_STRING, cs->name, cs->context, cs->exten, cs->priority, ast_state2str(cs->state),
-					S_OR(cs->appl, "(None)"),
-					cs->data,
-					cs->caller_number,
-					cs->accountcode,
-					cs->peeraccount,
+				ast_cli(a->fd, CONCISE_FORMAT_STRING, cs->base->name, cs->dialplan->context, cs->dialplan->exten, cs->dialplan->priority, ast_state2str(cs->state),
+					S_OR(cs->dialplan->appl, "(None)"),
+					cs->dialplan->data,
+					cs->caller->number,
+					cs->base->accountcode,
+					cs->peer->account,
 					cs->amaflags,
 					durbuf,
-					cs->bridgeid,
-					cs->uniqueid);
+					cs->bridge->id,
+					cs->base->uniqueid);
 			} else if (verbose) {
-				ast_cli(a->fd, VERBOSE_FORMAT_STRING, cs->name, cs->context, cs->exten, cs->priority, ast_state2str(cs->state),
-					S_OR(cs->appl, "(None)"),
-					S_OR(cs->data, "(Empty)"),
-					cs->caller_number,
+				ast_cli(a->fd, VERBOSE_FORMAT_STRING, cs->base->name, cs->dialplan->context, cs->dialplan->exten, cs->dialplan->priority, ast_state2str(cs->state),
+					S_OR(cs->dialplan->appl, "(None)"),
+					S_OR(cs->dialplan->data, "(Empty)"),
+					cs->caller->number,
 					durbuf,
-					cs->accountcode,
-					cs->peeraccount,
-					cs->bridgeid);
+					cs->base->accountcode,
+					cs->peer->account,
+					cs->bridge->id);
 			} else {
 				char locbuf[40] = "(None)";
 				char appdata[40] = "(None)";
 
-				if (!ast_strlen_zero(cs->context) && !ast_strlen_zero(cs->exten)) {
-					snprintf(locbuf, sizeof(locbuf), "%s@%s:%d", cs->exten, cs->context, cs->priority);
+				if (!ast_strlen_zero(cs->dialplan->context) && !ast_strlen_zero(cs->dialplan->exten)) {
+					snprintf(locbuf, sizeof(locbuf), "%s@%s:%d", cs->dialplan->exten, cs->dialplan->context, cs->dialplan->priority);
 				}
-				if (!ast_strlen_zero(cs->appl)) {
-					snprintf(appdata, sizeof(appdata), "%s(%s)", cs->appl, S_OR(cs->data, ""));
+				if (!ast_strlen_zero(cs->dialplan->appl)) {
+					snprintf(appdata, sizeof(appdata), "%s(%s)", cs->dialplan->appl, S_OR(cs->dialplan->data, ""));
 				}
-				ast_cli(a->fd, FORMAT_STRING, cs->name, locbuf, ast_state2str(cs->state), appdata);
+				ast_cli(a->fd, FORMAT_STRING, cs->base->name, locbuf, ast_state2str(cs->state), appdata);
 			}
 		}
 	}
@@ -1679,29 +1674,25 @@ char *ast_complete_channels(const char *line, const char *word, int pos, int sta
 	struct ao2_container *cached_channels;
 	char *ret = NULL;
 	struct ao2_iterator iter;
-	struct stasis_message *msg;
+	struct ast_channel_snapshot *snapshot;
 
 	if (pos != rpos) {
 		return NULL;
 	}
 
-	if (!(cached_channels = stasis_cache_dump(ast_channel_cache(), ast_channel_snapshot_type()))) {
-		return NULL;
-	}
+	cached_channels = ast_channel_cache_all();
 
 	iter = ao2_iterator_init(cached_channels, 0);
-	for (; (msg = ao2_iterator_next(&iter)); ao2_ref(msg, -1)) {
-		struct ast_channel_snapshot *snapshot = stasis_message_data(msg);
-
-		if (!strncasecmp(word, snapshot->name, wordlen) && (++which > state)) {
+	for (; (snapshot = ao2_iterator_next(&iter)); ao2_ref(snapshot, -1)) {
+		if (!strncasecmp(word, snapshot->base->name, wordlen) && (++which > state)) {
 			if (state != -1) {
-				ret = ast_strdup(snapshot->name);
-				ao2_ref(msg, -1);
+				ret = ast_strdup(snapshot->base->name);
+				ao2_ref(snapshot, -1);
 				break;
 			}
 
-			if (ast_cli_completion_add(ast_strdup(snapshot->name))) {
-				ao2_ref(msg, -1);
+			if (ast_cli_completion_add(ast_strdup(snapshot->base->name))) {
+				ao2_ref(snapshot, -1);
 				break;
 			}
 		}
@@ -1788,6 +1779,47 @@ static char *handle_cli_wait_fullybooted(struct ast_cli_entry *e, int cmd, struc
 	return CLI_SUCCESS;
 }
 
+
+#ifdef HAVE_MALLOC_TRIM
+
+/*!
+ * \internal
+ * \brief Attempt to reclaim unused heap memory.
+ *
+ * Users have reported that asterisk will sometimes be killed because it can't allocate
+ * more than around 3G of memory on a 32 bit system.
+ *
+ * Using malloc_trim() will help us to determine if it's because there's a leak or because
+ * the heap is so fragmented that there isn't enough contiguous memory available.
+ *
+ * \note malloc_trim() is a GNU extension and is therefore not portable.
+ */
+static char *handle_cli_malloc_trim(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	extern int malloc_trim(size_t __pad) __THROW;
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "malloc trim";
+		e->usage =
+			"Usage: malloc trim\n"
+			"       Try to give excess memory back to the OS.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (malloc_trim(0)) {
+		ast_cli(a->fd, "Returned some memory to the OS.\n");
+	} else {
+		ast_cli(a->fd, "No memory returned to the OS.\n");
+	}
+
+	return CLI_SUCCESS;
+}
+
+#endif
+
 static char *handle_help(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 
 static struct ast_cli_entry cli_cli[] = {
@@ -1833,6 +1865,11 @@ static struct ast_cli_entry cli_cli[] = {
 	AST_CLI_DEFINE(handle_cli_check_permissions, "Try a permissions config for a user"),
 
 	AST_CLI_DEFINE(handle_cli_wait_fullybooted, "Wait for Asterisk to be fully booted"),
+
+#ifdef HAVE_MALLOC_TRIM
+	AST_CLI_DEFINE(handle_cli_malloc_trim, "Return excess memory to the OS"),
+#endif
+
 };
 
 /*!

@@ -83,6 +83,9 @@ static int set_outbound_authentication_credentials(pjsip_auth_clt_sess *auth_ses
 			pj_cstr(&auth_creds[i].data, auths[i]->md5_creds);
 			auth_creds[i].data_type = PJSIP_CRED_DATA_DIGEST;
 			break;
+		case AST_SIP_AUTH_TYPE_GOOGLE_OAUTH:
+			/* nothing to do. handled seperately in res_pjsip_outbound_registration */
+			break;
 		case AST_SIP_AUTH_TYPE_ARTIFICIAL:
 			ast_log(LOG_ERROR, "Trying to set artificial outbound auth credentials shouldn't happen.\n");
 			break;
@@ -118,8 +121,8 @@ static int digest_create_request_with_auth(const struct ast_sip_auth_vector *aut
 	}
 	/* If there was no dialog, then this is probably a REGISTER so no endpoint */
 	if (!id) {
-		id = ast_alloca(strlen(challenge->pkt_info.src_name) + 7 /* ':' + port + NULL */);
-		sprintf(id, "%s:%d", challenge->pkt_info.src_name, challenge->pkt_info.src_port);
+		id = ast_alloca(AST_SOCKADDR_BUFLEN);
+		pj_sockaddr_print(&challenge->pkt_info.src_addr, id, AST_SOCKADDR_BUFLEN, 3);
 		id_type = "Host";
 	}
 

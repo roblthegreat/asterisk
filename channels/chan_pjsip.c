@@ -144,9 +144,16 @@ static struct ast_sip_session_supplement chan_pjsip_supplement = {
 	.session_begin = chan_pjsip_session_begin,
 	.session_end = chan_pjsip_session_end,
 	.incoming_request = chan_pjsip_incoming_request,
-	.incoming_response = chan_pjsip_incoming_response,
 	/* It is important that this supplement runs after media has been negotiated */
 	.response_priority = AST_SIP_SESSION_AFTER_MEDIA,
+};
+
+/*! \brief SIP session supplement structure just for responses */
+static struct ast_sip_session_supplement chan_pjsip_supplement_response = {
+	.method = "INVITE",
+	.priority = AST_SIP_SUPPLEMENT_PRIORITY_CHANNEL,
+	.incoming_response = chan_pjsip_incoming_response,
+	.response_priority = AST_SIP_SESSION_BEFORE_MEDIA | AST_SIP_SESSION_AFTER_MEDIA,
 };
 
 static int chan_pjsip_incoming_ack(struct ast_sip_session *session, struct pjsip_rx_data *rdata);
@@ -1128,7 +1135,6 @@ static int chan_pjsip_devicestate(const char *data)
 	RAII_VAR(struct ast_sip_endpoint *, endpoint, ast_sorcery_retrieve_by_id(ast_sip_get_sorcery(), "endpoint", data), ao2_cleanup);
 	enum ast_device_state state = AST_DEVICE_UNKNOWN;
 	RAII_VAR(struct ast_endpoint_snapshot *, endpoint_snapshot, NULL, ao2_cleanup);
-	RAII_VAR(struct stasis_cache *, cache, NULL, ao2_cleanup);
 	struct ast_devstate_aggregate aggregate;
 	int num, inuse = 0;
 
@@ -1149,28 +1155,21 @@ static int chan_pjsip_devicestate(const char *data)
 		state = AST_DEVICE_NOT_INUSE;
 	}
 
-	if (!endpoint_snapshot->num_channels || !(cache = ast_channel_cache())) {
+	if (!endpoint_snapshot->num_channels) {
 		return state;
 	}
 
 	ast_devstate_aggregate_init(&aggregate);
 
-	ao2_ref(cache, +1);
-
 	for (num = 0; num < endpoint_snapshot->num_channels; num++) {
-		RAII_VAR(struct stasis_message *, msg, NULL, ao2_cleanup);
 		struct ast_channel_snapshot *snapshot;
 
-		msg = stasis_cache_get(cache, ast_channel_snapshot_type(),
-			endpoint_snapshot->channel_ids[num]);
-
-		if (!msg) {
+		snapshot = ast_channel_snapshot_get_latest(endpoint_snapshot->channel_ids[num]);
+		if (!snapshot) {
 			continue;
 		}
 
-		snapshot = stasis_message_data(msg);
-
-		if (chan_pjsip_get_hold(snapshot->uniqueid)) {
+		if (chan_pjsip_get_hold(snapshot->base->uniqueid)) {
 			ast_devstate_aggregate_add(&aggregate, AST_DEVICE_ONHOLD);
 		} else {
 			ast_devstate_aggregate_add(&aggregate, ast_state_chan2dev(snapshot->state));
@@ -1180,6 +1179,8 @@ static int chan_pjsip_devicestate(const char *data)
 			(snapshot->state == AST_STATE_BUSY)) {
 			inuse++;
 		}
+
+		ao2_ref(snapshot, -1);
 	}
 
 	if (endpoint->devicestate_busy_at && (inuse == endpoint->devicestate_busy_at)) {
@@ -1373,7 +1374,8 @@ static int is_colp_update_allowed(struct ast_sip_session *session)
 	struct ast_party_id connected_id;
 	int update_allowed = 0;
 
-	if (!session->endpoint->id.send_pai && !session->endpoint->id.send_rpid) {
+	if (!session->endpoint->id.send_connected_line
+		|| (!session->endpoint->id.send_pai && !session->endpoint->id.send_rpid)) {
 		return 0;
 	}
 
@@ -3012,7 +3014,14 @@ static void chan_pjsip_incoming_response(struct ast_sip_session *session, struct
 		ast_channel_unlock(session->channel);
 		break;
 	case 183:
-		ast_queue_control(session->channel, AST_CONTROL_PROGRESS);
+		if (session->endpoint->ignore_183_without_sdp) {
+			pjsip_rdata_sdp_info *sdp = pjsip_rdata_get_sdp_info(rdata);
+			if (sdp && sdp->body.ptr) {
+				ast_queue_control(session->channel, AST_CONTROL_PROGRESS);
+			}
+		} else {
+			ast_queue_control(session->channel, AST_CONTROL_PROGRESS);
+		}
 		break;
 	case 200:
 		ast_queue_control(session->channel, AST_CONTROL_ANSWER);
@@ -3042,6 +3051,11 @@ static int update_devstate(void *obj, void *arg, int flags)
 static struct ast_custom_function chan_pjsip_dial_contacts_function = {
 	.name = "PJSIP_DIAL_CONTACTS",
 	.read = pjsip_acf_dial_contacts_read,
+};
+
+static struct ast_custom_function chan_pjsip_parse_uri_function = {
+	.name = "PJSIP_PARSE_URI",
+	.read = pjsip_acf_parse_uri_read,
 };
 
 static struct ast_custom_function media_offer_function = {
@@ -3093,6 +3107,11 @@ static int load_module(void)
 		goto end;
 	}
 
+	if (ast_custom_function_register(&chan_pjsip_parse_uri_function)) {
+		ast_log(LOG_ERROR, "Unable to register PJSIP_PARSE_URI dialplan function\n");
+		goto end;
+	}
+
 	if (ast_custom_function_register(&media_offer_function)) {
 		ast_log(LOG_WARNING, "Unable to register PJSIP_MEDIA_OFFER dialplan function\n");
 		goto end;
@@ -3109,6 +3128,7 @@ static int load_module(void)
 	}
 
 	ast_sip_session_register_supplement(&chan_pjsip_supplement);
+	ast_sip_session_register_supplement(&chan_pjsip_supplement_response);
 
 	if (!(pjsip_uids_onhold = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_RWLOCK,
 			AO2_CONTAINER_ALLOC_OPT_DUPS_REJECT, 37, uid_hold_hash_fn,
@@ -3123,10 +3143,6 @@ static int load_module(void)
 
 	if (pjsip_channel_cli_register()) {
 		ast_log(LOG_ERROR, "Unable to register PJSIP Channel CLI\n");
-		ast_sip_session_unregister_supplement(&chan_pjsip_ack_supplement);
-		ast_sip_session_unregister_supplement(&pbx_start_supplement);
-		ast_sip_session_unregister_supplement(&chan_pjsip_supplement);
-		ast_sip_session_unregister_supplement(&call_pickup_supplement);
 		goto end;
 	}
 
@@ -3142,9 +3158,15 @@ static int load_module(void)
 end:
 	ao2_cleanup(pjsip_uids_onhold);
 	pjsip_uids_onhold = NULL;
+	ast_sip_session_unregister_supplement(&chan_pjsip_ack_supplement);
+	ast_sip_session_unregister_supplement(&pbx_start_supplement);
+	ast_sip_session_unregister_supplement(&chan_pjsip_supplement_response);
+	ast_sip_session_unregister_supplement(&chan_pjsip_supplement);
+	ast_sip_session_unregister_supplement(&call_pickup_supplement);
 	ast_custom_function_unregister(&dtmf_mode_function);
 	ast_custom_function_unregister(&media_offer_function);
 	ast_custom_function_unregister(&chan_pjsip_dial_contacts_function);
+	ast_custom_function_unregister(&chan_pjsip_parse_uri_function);
 	ast_custom_function_unregister(&session_refresh_function);
 	ast_channel_unregister(&chan_pjsip_tech);
 	ast_rtp_glue_unregister(&chan_pjsip_rtp_glue);
@@ -3160,6 +3182,7 @@ static int unload_module(void)
 
 	pjsip_channel_cli_unregister();
 
+	ast_sip_session_unregister_supplement(&chan_pjsip_supplement_response);
 	ast_sip_session_unregister_supplement(&chan_pjsip_supplement);
 	ast_sip_session_unregister_supplement(&pbx_start_supplement);
 	ast_sip_session_unregister_supplement(&chan_pjsip_ack_supplement);
@@ -3168,6 +3191,7 @@ static int unload_module(void)
 	ast_custom_function_unregister(&dtmf_mode_function);
 	ast_custom_function_unregister(&media_offer_function);
 	ast_custom_function_unregister(&chan_pjsip_dial_contacts_function);
+	ast_custom_function_unregister(&chan_pjsip_parse_uri_function);
 	ast_custom_function_unregister(&session_refresh_function);
 
 	ast_channel_unregister(&chan_pjsip_tech);

@@ -588,7 +588,9 @@ static int ast_register_indication(struct ast_tone_zone *zone, const char *indic
 	}
 	AST_LIST_TRAVERSE_SAFE_END;
 
-	if (!(ts = ao2_alloc(sizeof(*ts), ast_tone_zone_sound_destructor))) {
+	ts = ao2_alloc_options(sizeof(*ts), ast_tone_zone_sound_destructor,
+		AO2_ALLOC_OPT_LOCK_NOLOCK);
+	if (!ts) {
 		return -1;
 	}
 
@@ -1131,8 +1133,8 @@ static int unload_module(void)
 /*! \brief Load indications module */
 static int load_module(void)
 {
-	ast_tone_zones = ao2_container_alloc(NUM_TONE_ZONE_BUCKETS,
-			ast_tone_zone_hash, ast_tone_zone_cmp);
+	ast_tone_zones = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		NUM_TONE_ZONE_BUCKETS, ast_tone_zone_hash, NULL, ast_tone_zone_cmp);
 	if (!ast_tone_zones) {
 		return AST_MODULE_LOAD_FAILURE;
 	}
@@ -1158,4 +1160,5 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_
 	.unload = unload_module,
 	.reload = reload_module,
 	.load_pri = AST_MODPRI_CORE,
+	.requires = "extconfig",
 );

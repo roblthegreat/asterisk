@@ -93,7 +93,8 @@ parameters. At the moment, this is done as follows:
 
     struct ao2_container *c;
 
-    c = ao2_container_alloc(MAX_BUCKETS, my_hash_fn, my_cmp_fn);
+    c = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, MAX_BUCKETS,
+        my_hash_fn, NULL, my_cmp_fn);
     \endcode
 
 where
@@ -109,7 +110,7 @@ A container knows little or nothing about the objects it stores,
 other than the fact that they have been created by ao2_alloc().
 All knowledge of the (user-defined) internals of the objects
 is left to the (user-supplied) functions passed as arguments
-to ao2_container_alloc().
+to ao2_container_alloc_hash().
 
 If we want to insert an object in a container, we should
 initialize its fields -- especially, those used by my_hash_fn() --
@@ -752,6 +753,9 @@ int __ao2_trylock(void *a, enum ao2_lock_req lock_how, const char *file, const c
  * lock address, this allows you to correlate against
  * object address, to match objects to reported locks.
  *
+ * \warning AO2 lock objects do not include tracking fields when
+ * DEBUG_THREADS is not enabled.
+ *
  * \since 1.6.1
  */
 void *ao2_object_get_lockaddr(void *obj);
@@ -933,19 +937,7 @@ and perform various operations on them.
 Internally, objects are stored in lists, hash tables or other
 data structures depending on the needs.
 
-\note NOTA BENE: at the moment the only container we support is the
-    hash table and its degenerate form, the list.
-
 Operations on container include:
-
-  -  c = \b ao2_container_alloc(size, hash_fn, cmp_fn)
-    allocate a container with desired size and default compare
-    and hash function
-         -The compare function returns an int, which
-         can be 0 for not found, CMP_STOP to stop end a traversal,
-         or CMP_MATCH if they are equal
-         -The hash function returns an int. The hash function
-         takes two argument, the object pointer and a flags field,
 
   -  \b ao2_find(c, arg, flags)
     returns zero or more elements matching a given criteria
@@ -1301,35 +1293,6 @@ struct ao2_container;
  * We allocate space for a struct astobj_container, struct container
  * and the buckets[] array.
  *
- * \param options Container ao2 object options (See enum ao2_alloc_opts)
- * \param n_buckets Number of buckets for hash
- * \param hash_fn Pointer to a function computing a hash value. (NULL if everyting goes in first bucket.)
- * \param cmp_fn Pointer to a compare function used by ao2_find. (NULL to match everything)
- * \param tag used for debugging.
- *
- * \return A pointer to a struct container.
- *
- * \note Destructor is set implicitly.
- * \note This is legacy container creation that is mapped to the new method.
- */
-
-#define ao2_t_container_alloc_options(options, n_buckets, hash_fn, cmp_fn, tag) \
-	ao2_t_container_alloc_hash((options), 0, (n_buckets), (hash_fn), NULL, (cmp_fn), (tag))
-#define ao2_container_alloc_options(options, n_buckets, hash_fn, cmp_fn) \
-	ao2_container_alloc_hash((options), 0, (n_buckets), (hash_fn), NULL, (cmp_fn))
-
-#define ao2_t_container_alloc(n_buckets, hash_fn, cmp_fn, tag) \
-	ao2_t_container_alloc_options(AO2_ALLOC_OPT_LOCK_MUTEX, (n_buckets), (hash_fn), (cmp_fn), (tag))
-#define ao2_container_alloc(n_buckets, hash_fn, cmp_fn) \
-	ao2_container_alloc_options(AO2_ALLOC_OPT_LOCK_MUTEX, (n_buckets), (hash_fn), (cmp_fn))
-
-/*!
- * \brief Allocate and initialize a hash container with the desired number of buckets.
- *
- * \details
- * We allocate space for a struct astobj_container, struct container
- * and the buckets[] array.
- *
  * \param ao2_options Container ao2 object options (See enum ao2_alloc_opts)
  * \param container_options Container behaviour options (See enum ao2_container_opts)
  * \param n_buckets Number of buckets for hash
@@ -1424,6 +1387,28 @@ int ao2_container_count(struct ao2_container *c);
  * \retval -1 on error.
  */
 int ao2_container_dup(struct ao2_container *dest, struct ao2_container *src, enum search_flags flags);
+
+/*!
+ * \brief Copy object references associated with src container weakproxies into the dest container.
+ *
+ * \param dest Container to copy src strong object references into.
+ * \param src Container to copy all weak object references from.
+ * \param flags OBJ_NOLOCK if a lock is already held on both containers.
+ *    Otherwise, the src container is locked first.
+ *
+ * \pre The dest container must be empty.  If the duplication fails, the
+ * dest container will be returned empty.
+ *
+ * \note This can potentially be expensive because a malloc is
+ * needed for every object in the src container.
+ *
+ * \note Every object inside the container is locked by \ref ao2_weakproxy_get_object.
+ *       Any weakproxy in \ref src with no associated object is ignored.
+ *
+ * \retval 0 on success.
+ * \retval -1 on error.
+ */
+int ao2_container_dup_weakproxy_objs(struct ao2_container *dest, struct ao2_container *src, enum search_flags flags);
 
 /*!
  * \brief Create a clone/copy of the given container.

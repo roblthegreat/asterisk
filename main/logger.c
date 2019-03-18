@@ -385,6 +385,9 @@ static int format_log_default(struct logchannel *chan, struct logmsg *msg, char 
 	case LOGTYPE_CONSOLE:
 		{
 			char linestr[32];
+			int has_file = !ast_strlen_zero(msg->file);
+			int has_line = (msg->line > 0);
+			int has_func = !ast_strlen_zero(msg->function);
 
 			/*
 			 * Verbose messages are interpreted by console channels in their own
@@ -394,18 +397,20 @@ static int format_log_default(struct logchannel *chan, struct logmsg *msg, char 
 				return logger_add_verbose_magic(msg, buf, size);
 			}
 
-			/* Turn the numeric line number into a string for colorization */
+			/* Turn the numerical line number into a string */
 			snprintf(linestr, sizeof(linestr), "%d", msg->line);
-
-			snprintf(buf, size, "[%s] " COLORIZE_FMT "[%d]%s: " COLORIZE_FMT ":" COLORIZE_FMT " " COLORIZE_FMT ": %s",
-				 msg->date,
-				 COLORIZE(colors[msg->level], 0, msg->level_name),
-				 msg->lwp,
-				 call_identifier_str,
-				 COLORIZE(COLOR_BRWHITE, 0, msg->file),
-				 COLORIZE(COLOR_BRWHITE, 0, linestr),
-				 COLORIZE(COLOR_BRWHITE, 0, msg->function),
-				 msg->message);
+			/* Build string to print out */
+			snprintf(buf, size, "[%s] " COLORIZE_FMT "[%d]%s: " COLORIZE_FMT "%s" COLORIZE_FMT " " COLORIZE_FMT "%s %s",
+				msg->date,
+				COLORIZE(colors[msg->level], 0, msg->level_name),
+				msg->lwp,
+				call_identifier_str,
+				COLORIZE(COLOR_BRWHITE, 0, has_file ? msg->file : ""),
+				has_file ? ":" : "",
+				COLORIZE(COLOR_BRWHITE, 0, has_line ? linestr : ""),
+				COLORIZE(COLOR_BRWHITE, 0, has_func ? msg->function : ""),
+				has_func ? ":" : "",
+				msg->message);
 		}
 		break;
 	}
@@ -621,7 +626,8 @@ static struct logchannel *make_logchannel(const char *channel, const char *compo
 	return chan;
 }
 
-/* \brief Read config, setup channels.
+/*!
+ * \brief Read config, setup channels.
  * \param altconf Alternate configuration file to read.
  *
  * \pre logchannels list is write locked
@@ -663,14 +669,11 @@ static int init_logger_chain(const char *altconf)
 
 	/* If no config file, we're fine, set default options. */
 	if (!cfg) {
-		if (!(chan = ast_calloc(1, sizeof(*chan) + 1))) {
-			fprintf(stderr, "Failed to initialize default logging\n");
+		chan = make_logchannel("console", "error,warning,notice,verbose", 0, 0);
+		if (!chan) {
+			fprintf(stderr, "ERROR: Failed to initialize default logging\n");
 			return -1;
 		}
-		chan->type = LOGTYPE_CONSOLE;
-		chan->logmask = (1 << __LOG_WARNING) | (1 << __LOG_NOTICE) | (1 << __LOG_ERROR)
-			| (1 << __LOG_VERBOSE);
-		memcpy(&chan->formatter, &logformatter_default, sizeof(chan->formatter));
 
 		AST_RWLIST_INSERT_HEAD(&logchannels, chan, list);
 		global_logmask |= chan->logmask;
@@ -738,7 +741,8 @@ static int init_logger_chain(const char *altconf)
 
 	var = ast_variable_browse(cfg, "logfiles");
 	for (; var; var = var->next) {
-		if (!(chan = make_logchannel(var->name, var->value, var->lineno, 0))) {
+		chan = make_logchannel(var->name, var->value, var->lineno, 0);
+		if (!chan) {
 			/* Print error message directly to the consoles since the lock is held
 			 * and we don't want to unlock with the list partially built */
 			ast_console_puts_mutable("ERROR: Unable to create log channel '", __LOG_ERROR);
@@ -2004,18 +2008,24 @@ static void __attribute__((format(printf, 7, 0))) ast_log_full(int level, int su
 
 void ast_log(int level, const char *file, int line, const char *function, const char *fmt, ...)
 {
-	ast_callid callid;
 	va_list ap;
+
+	va_start(ap, fmt);
+	ast_log_ap(level, file, line, function, fmt, ap);
+	va_end(ap);
+}
+
+void ast_log_ap(int level, const char *file, int line, const char *function, const char *fmt, va_list ap)
+{
+	ast_callid callid;
 
 	callid = ast_read_threadstorage_callid();
 
-	va_start(ap, fmt);
 	if (level == __LOG_VERBOSE) {
 		__ast_verbose_ap(file, line, function, 0, callid, fmt, ap);
 	} else {
 		ast_log_full(level, -1, file, line, function, callid, fmt, ap);
 	}
-	va_end(ap);
 }
 
 void ast_log_safe(int level, const char *file, int line, const char *function, const char *fmt, ...)
@@ -2058,7 +2068,7 @@ void ast_log_backtrace(void)
 #ifdef HAVE_BKTR
 	struct ast_bt *bt;
 	int i = 0;
-	char **strings;
+	struct ast_vector_string *strings;
 
 	if (!(bt = ast_bt_create())) {
 		ast_log(LOG_WARNING, "Unable to allocate space for backtrace structure\n");
@@ -2066,14 +2076,21 @@ void ast_log_backtrace(void)
 	}
 
 	if ((strings = ast_bt_get_symbols(bt->addresses, bt->num_frames))) {
-		ast_verbose("Got %d backtrace record%c\n", bt->num_frames, bt->num_frames != 1 ? 's' : ' ');
-		for (i = 3; i < bt->num_frames - 2; i++) {
-			ast_verbose("#%d: [%p] %s\n", i - 3, bt->addresses[i], strings[i]);
+		int count = AST_VECTOR_SIZE(strings);
+		struct ast_str *buf = ast_str_create(bt->num_frames * 64);
+
+		if (buf) {
+			ast_str_append(&buf, 0, "Got %d backtrace record%c\n", count - 3, count - 3 != 1 ? 's' : ' ');
+			for (i = 3; i < AST_VECTOR_SIZE(strings); i++) {
+				ast_str_append(&buf, 0, "#%2d: %s\n", i - 3, AST_VECTOR_GET(strings, i));
+			}
+			ast_log_safe(__LOG_ERROR, NULL, 0, NULL, "%s\n", ast_str_buffer(buf));
+			ast_free(buf);
 		}
 
-		ast_std_free(strings);
+		ast_bt_free_symbols(strings);
 	} else {
-		ast_verbose("Could not allocate memory for backtrace\n");
+		ast_log(LOG_ERROR, "Could not allocate memory for backtrace\n");
 	}
 	ast_bt_destroy(bt);
 #else
@@ -2381,6 +2398,7 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_
 	.support_level = AST_MODULE_SUPPORT_CORE,
 	.load = load_module,
 	.unload = unload_module,
+	/* This reload does not support realtime so it does not require "extconfig". */
 	.reload = reload_module,
 	.load_pri = 0,
 );

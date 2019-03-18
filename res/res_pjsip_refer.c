@@ -179,7 +179,7 @@ static void refer_progress_bridge(void *data, struct stasis_subscription *sub,
 	}
 
 	enter_blob = stasis_message_data(message);
-	if (strcmp(enter_blob->channel->uniqueid, progress->transferee)) {
+	if (strcmp(enter_blob->channel->base->uniqueid, progress->transferee)) {
 		/* Don't care */
 		return;
 	}
@@ -686,6 +686,10 @@ static void refer_blind_callback(struct ast_channel *chan, struct transfer_chann
 			ast_channel_unlock(chan);
 
 			ao2_cleanup(refer->progress);
+		} else {
+			stasis_subscription_accept_message_type(refer->progress->bridge_sub, ast_channel_entered_bridge_type());
+			stasis_subscription_accept_message_type(refer->progress->bridge_sub, stasis_subscription_change_type());
+			stasis_subscription_set_filter(refer->progress->bridge_sub, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 		}
 	}
 

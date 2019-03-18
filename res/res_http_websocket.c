@@ -99,6 +99,7 @@ struct ast_websocket {
 	unsigned int close_sent:1;          /*!< Bit to indicate that the session close opcode has been sent and no further data will be sent */
 	struct websocket_client *client;    /*!< Client object when connected as a client websocket */
 	char session_id[AST_UUID_STR_LEN];  /*!< The identifier for the websocket session */
+	uint16_t close_status_code;         /*!< Status code sent in a CLOSE frame upon shutdown */
 };
 
 /*! \brief Hashing function for protocols */
@@ -147,7 +148,8 @@ static struct ast_websocket_server *websocket_server_create_impl(void)
 		return NULL;
 	}
 
-	server->protocols = ao2_container_alloc(MAX_PROTOCOL_BUCKETS, protocol_hash_fn, protocol_cmp_fn);
+	server->protocols = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		MAX_PROTOCOL_BUCKETS, protocol_hash_fn, NULL, protocol_cmp_fn);
 	if (!server->protocols) {
 		return NULL;
 	}
@@ -172,7 +174,7 @@ static void session_destroy_fn(void *obj)
 	struct ast_websocket *session = obj;
 
 	if (session->stream) {
-		ast_websocket_close(session, 0);
+		ast_websocket_close(session, session->close_status_code);
 		if (session->stream) {
 			ast_iostream_close(session->stream);
 			session->stream = NULL;
@@ -577,7 +579,7 @@ int AST_OPTIONAL_API_NAME(ast_websocket_read)(struct ast_websocket *session, cha
 	*opcode = buf[0] & 0xf;
 	*payload_len = buf[1] & 0x7f;
 	if (*opcode == AST_WEBSOCKET_OPCODE_TEXT || *opcode == AST_WEBSOCKET_OPCODE_BINARY || *opcode == AST_WEBSOCKET_OPCODE_CONTINUATION ||
-	    *opcode == AST_WEBSOCKET_OPCODE_PING || *opcode == AST_WEBSOCKET_OPCODE_PONG) {
+	    *opcode == AST_WEBSOCKET_OPCODE_PING || *opcode == AST_WEBSOCKET_OPCODE_PONG  || *opcode == AST_WEBSOCKET_OPCODE_CLOSE) {
 		fin = (buf[0] >> 7) & 1;
 		mask_present = (buf[1] >> 7) & 1;
 
@@ -630,12 +632,31 @@ int AST_OPTIONAL_API_NAME(ast_websocket_read)(struct ast_websocket *session, cha
 		}
 
 		/* Per the RFC for PING we need to send back an opcode with the application data as received */
-		if ((*opcode == AST_WEBSOCKET_OPCODE_PING) && (ast_websocket_write(session, AST_WEBSOCKET_OPCODE_PONG, *payload, *payload_len))) {
+		if (*opcode == AST_WEBSOCKET_OPCODE_PING) {
+			if (ast_websocket_write(session, AST_WEBSOCKET_OPCODE_PONG, *payload, *payload_len)) {
+				ast_websocket_close(session, 1009);
+			}
 			*payload_len = 0;
-			ast_websocket_close(session, 1009);
 			return 0;
 		}
 
+		/* Stop PONG processing here */
+		if (*opcode == AST_WEBSOCKET_OPCODE_PONG) {
+			*payload_len = 0;
+			return 0;
+		}
+
+		/* Save the CLOSE status code which will be sent in our own CLOSE in the destructor */
+		if (*opcode == AST_WEBSOCKET_OPCODE_CLOSE) {
+			session->closing = 1;
+			if (*payload_len >= 2) {
+				session->close_status_code = ntohs(get_unaligned_uint16(*payload));
+			}
+			*payload_len = 0;
+			return 0;
+		}
+
+		/* Below this point we are handling TEXT, BINARY or CONTINUATION opcodes */
 		if (*payload_len) {
 			if (!(new_payload = ast_realloc(session->payload, (session->payload_len + *payload_len)))) {
 				ast_log(LOG_WARNING, "Failed allocation: %p, %zu, %"PRIu64"\n",
@@ -675,28 +696,6 @@ int AST_OPTIONAL_API_NAME(ast_websocket_read)(struct ast_websocket *session, cha
 			*payload = session->payload;
 			session->payload_len = 0;
 		}
-	} else if (*opcode == AST_WEBSOCKET_OPCODE_CLOSE) {
-		session->closing = 1;
-
-		/* Make the payload available so the user can look at the reason code if they so desire */
-		if (!*payload_len) {
-			return 0;
-		}
-
-		if (!(new_payload = ast_realloc(session->payload, *payload_len))) {
-			ast_log(LOG_WARNING, "Failed allocation: %p, %"PRIu64"\n",
-					session->payload, *payload_len);
-			*payload_len = 0;
-			return -1;
-		}
-
-		session->payload = new_payload;
-		if (ws_safe_read(session, &buf[frame_size], *payload_len, opcode)) {
-			return -1;
-		}
-		memcpy(session->payload, &buf[frame_size], *payload_len);
-		*payload = session->payload;
-		frame_size += *payload_len;
 	} else {
 		ast_log(LOG_WARNING, "WebSocket unknown opcode %u\n", *opcode);
 		/* We received an opcode that we don't understand, the RFC states that 1003 is for a type of data that can't be accepted... opcodes
@@ -751,7 +750,8 @@ static void websocket_bad_request(struct ast_tcptls_session_instance *ser)
 int AST_OPTIONAL_API_NAME(ast_websocket_uri_cb)(struct ast_tcptls_session_instance *ser, const struct ast_http_uri *urih, const char *uri, enum ast_http_method method, struct ast_variable *get_vars, struct ast_variable *headers)
 {
 	struct ast_variable *v;
-	char *upgrade = NULL, *key = NULL, *key1 = NULL, *key2 = NULL, *protos = NULL, *requested_protocols = NULL, *protocol = NULL;
+	const char *upgrade = NULL, *key = NULL, *key1 = NULL, *key2 = NULL, *protos = NULL;
+	char *requested_protocols = NULL, *protocol = NULL;
 	int version = 0, flags = 1;
 	struct ast_websocket_protocol *protocol_handler = NULL;
 	struct ast_websocket *session;
@@ -770,16 +770,15 @@ int AST_OPTIONAL_API_NAME(ast_websocket_uri_cb)(struct ast_tcptls_session_instan
 	/* Get the minimum headers required to satisfy our needs */
 	for (v = headers; v; v = v->next) {
 		if (!strcasecmp(v->name, "Upgrade")) {
-			upgrade = ast_strip(ast_strdupa(v->value));
+			upgrade = v->value;
 		} else if (!strcasecmp(v->name, "Sec-WebSocket-Key")) {
-			key = ast_strip(ast_strdupa(v->value));
+			key = v->value;
 		} else if (!strcasecmp(v->name, "Sec-WebSocket-Key1")) {
-			key1 = ast_strip(ast_strdupa(v->value));
+			key1 = v->value;
 		} else if (!strcasecmp(v->name, "Sec-WebSocket-Key2")) {
-			key2 = ast_strip(ast_strdupa(v->value));
+			key2 = v->value;
 		} else if (!strcasecmp(v->name, "Sec-WebSocket-Protocol")) {
-			requested_protocols = ast_strip(ast_strdupa(v->value));
-			protos = ast_strdupa(requested_protocols);
+			protos = v->value;
 		} else if (!strcasecmp(v->name, "Sec-WebSocket-Version")) {
 			if (sscanf(v->value, "%30d", &version) != 1) {
 				version = 0;
@@ -793,7 +792,7 @@ int AST_OPTIONAL_API_NAME(ast_websocket_uri_cb)(struct ast_tcptls_session_instan
 			ast_sockaddr_stringify(&ser->remote_address));
 		ast_http_error(ser, 426, "Upgrade Required", NULL);
 		return 0;
-	} else if (ast_strlen_zero(requested_protocols)) {
+	} else if (ast_strlen_zero(protos)) {
 		/* If there's only a single protocol registered, and the
 		 * client doesn't specify what protocol it's using, go ahead
 		 * and accept the connection */
@@ -814,9 +813,12 @@ int AST_OPTIONAL_API_NAME(ast_websocket_uri_cb)(struct ast_tcptls_session_instan
 		return 0;
 	}
 
-	/* Iterate through the requested protocols trying to find one that we have a handler for */
-	while (!protocol_handler && (protocol = strsep(&requested_protocols, ","))) {
-		protocol_handler = ao2_find(server->protocols, ast_strip(protocol), OBJ_KEY);
+	if (!protocol_handler && protos) {
+		requested_protocols = ast_strdupa(protos);
+		/* Iterate through the requested protocols trying to find one that we have a handler for */
+		while (!protocol_handler && (protocol = strsep(&requested_protocols, ","))) {
+			protocol_handler = ao2_find(server->protocols, ast_strip(protocol), OBJ_KEY);
+		}
 	}
 
 	/* If no protocol handler exists bump this back to the requester */

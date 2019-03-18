@@ -65,6 +65,10 @@ struct stasis_app {
 	enum stasis_app_subscription_model subscription_model;
 	/*! Whether or not someone wants to see debug messages about this app */
 	int debug;
+	/*! An array of allowed events types for this application */
+	struct ast_json *events_allowed;
+	/*! An array of disallowed events types for this application */
+	struct ast_json *events_disallowed;
 	/*! Name of the Stasis application */
 	char name[];
 };
@@ -144,17 +148,11 @@ static struct app_forwards *forwards_create_channel(struct stasis_app *app,
 	}
 
 	forwards->forward_type = FORWARD_CHANNEL;
-	if (chan) {
-		forwards->topic_forward = stasis_forward_all(ast_channel_topic(chan),
-			app->topic);
-	}
-	forwards->topic_cached_forward = stasis_forward_all(
-		chan ? ast_channel_topic_cached(chan) : ast_channel_topic_all_cached(),
+	forwards->topic_forward = stasis_forward_all(
+		chan ? ast_channel_topic(chan) : ast_channel_topic_all(),
 		app->topic);
 
-	if ((!forwards->topic_forward && chan) || !forwards->topic_cached_forward) {
-		/* Half-subscribed is a bad thing */
-		forwards_unsubscribe(forwards);
+	if (!forwards->topic_forward) {
 		ao2_ref(forwards, -1);
 		return NULL;
 	}
@@ -178,16 +176,9 @@ static struct app_forwards *forwards_create_bridge(struct stasis_app *app,
 	}
 
 	forwards->forward_type = FORWARD_BRIDGE;
-	if (bridge) {
-		forwards->topic_forward = stasis_forward_all(ast_bridge_topic(bridge),
-			app->topic);
-	}
-	forwards->topic_cached_forward = stasis_forward_all(
-		bridge ? ast_bridge_topic_cached(bridge) : ast_bridge_topic_all_cached(),
-		app->topic);
+	forwards->topic_forward = stasis_forward_all(ast_bridge_topic(bridge), app->topic);
 
-	if ((!forwards->topic_forward && bridge) || !forwards->topic_cached_forward) {
-		/* Half-subscribed is a bad thing */
+	if (!forwards->topic_forward && bridge) {
 		forwards_unsubscribe(forwards);
 		ao2_ref(forwards, -1);
 		return NULL;
@@ -296,6 +287,8 @@ static int forwards_sort(const void *obj_left, const void *obj_right, int flags)
 static void app_dtor(void *obj)
 {
 	struct stasis_app *app = obj;
+	size_t size = strlen("stasis-") + strlen(app->name) + 1;
+	char context_name[size];
 
 	ast_verb(1, "Destroying Stasis app %s\n", app->name);
 
@@ -303,12 +296,23 @@ static void app_dtor(void *obj)
 	ast_assert(app->bridge_router == NULL);
 	ast_assert(app->endpoint_router == NULL);
 
+	/* If we created a context for this application, remove it */
+	strcpy(context_name, "stasis-");
+	strcat(context_name, app->name);
+	ast_context_destroy_by_name(context_name, "res_stasis");
+
 	ao2_cleanup(app->topic);
 	app->topic = NULL;
 	ao2_cleanup(app->forwards);
 	app->forwards = NULL;
 	ao2_cleanup(app->data);
 	app->data = NULL;
+
+	ast_json_unref(app->events_allowed);
+	app->events_allowed = NULL;
+	ast_json_unref(app->events_disallowed);
+	app->events_disallowed = NULL;
+
 }
 
 static void call_forwarded_handler(struct stasis_app *app, struct stasis_message *message)
@@ -321,7 +325,7 @@ static void call_forwarded_handler(struct stasis_app *app, struct stasis_message
 		return;
 	}
 
-	chan = ast_channel_get_by_name(snapshot->uniqueid);
+	chan = ast_channel_get_by_name(snapshot->base->uniqueid);
 	if (!chan) {
 		return;
 	}
@@ -330,16 +334,25 @@ static void call_forwarded_handler(struct stasis_app *app, struct stasis_message
 	ast_channel_unref(chan);
 }
 
+static void sub_subscription_change_handler(void *data, struct stasis_subscription *sub,
+	struct stasis_message *message)
+{
+	struct stasis_app *app = data;
+
+	if (stasis_subscription_final_message(sub, message)) {
+		ao2_cleanup(app);
+	}
+}
+
 static void sub_default_handler(void *data, struct stasis_subscription *sub,
 	struct stasis_message *message)
 {
 	struct stasis_app *app = data;
 	struct ast_json *json;
 
-	if (stasis_subscription_final_message(sub, message)) {
-		ao2_cleanup(app);
-	}
-
+	/* The dial type can be converted to JSON so it will always be passed
+	 * here.
+	 */
 	if (stasis_message_type(message) == ast_channel_dial_type()) {
 		call_forwarded_handler(app, message);
 	}
@@ -397,8 +410,8 @@ static struct ast_json *channel_destroyed_event(
 	return ast_json_pack("{s: s, s: o, s: i, s: s, s: o}",
 		"type", "ChannelDestroyed",
 		"timestamp", ast_json_timeval(*tv, NULL),
-		"cause", snapshot->hangupcause,
-		"cause_txt", ast_cause2str(snapshot->hangupcause),
+		"cause", snapshot->hangup->cause,
+		"cause_txt", ast_cause2str(snapshot->hangup->cause),
 		"channel", json_channel);
 }
 
@@ -420,7 +433,7 @@ static struct ast_json *channel_state(
 
 	if (!old_snapshot) {
 		return channel_created_event(snapshot, tv);
-	} else if (!new_snapshot) {
+	} else if (ast_test_flag(&new_snapshot->flags, AST_FLAG_DEAD)) {
 		return channel_destroyed_event(snapshot, tv);
 	} else if (old_snapshot->state != new_snapshot->state) {
 		return channel_state_change_event(snapshot, tv);
@@ -436,13 +449,13 @@ static struct ast_json *channel_dialplan(
 {
 	struct ast_json *json_channel;
 
-	/* No Newexten event on cache clear or first event */
-	if (!old_snapshot || !new_snapshot) {
+	/* No Newexten event on first channel snapshot */
+	if (!old_snapshot) {
 		return NULL;
 	}
 
 	/* Empty application is not valid for a Newexten event */
-	if (ast_strlen_zero(new_snapshot->appl)) {
+	if (ast_strlen_zero(new_snapshot->dialplan->appl)) {
 		return NULL;
 	}
 
@@ -458,8 +471,8 @@ static struct ast_json *channel_dialplan(
 	return ast_json_pack("{s: s, s: o, s: s, s: s, s: o}",
 		"type", "ChannelDialplan",
 		"timestamp", ast_json_timeval(*tv, NULL),
-		"dialplan_app", new_snapshot->appl,
-		"dialplan_app_data", AST_JSON_UTF8_VALIDATE(new_snapshot->data),
+		"dialplan_app", new_snapshot->dialplan->appl,
+		"dialplan_app_data", AST_JSON_UTF8_VALIDATE(new_snapshot->dialplan->data),
 		"channel", json_channel);
 }
 
@@ -470,8 +483,8 @@ static struct ast_json *channel_callerid(
 {
 	struct ast_json *json_channel;
 
-	/* No NewCallerid event on cache clear or first event */
-	if (!old_snapshot || !new_snapshot) {
+	/* No NewCallerid event on first channel snapshot */
+	if (!old_snapshot) {
 		return NULL;
 	}
 
@@ -487,9 +500,9 @@ static struct ast_json *channel_callerid(
 	return ast_json_pack("{s: s, s: o, s: i, s: s, s: o}",
 		"type", "ChannelCallerId",
 		"timestamp", ast_json_timeval(*tv, NULL),
-		"caller_presentation", new_snapshot->caller_pres,
+		"caller_presentation", new_snapshot->caller->pres,
 		"caller_presentation_txt", ast_describe_caller_presentation(
-			new_snapshot->caller_pres),
+			new_snapshot->caller->pres),
 		"channel", json_channel);
 }
 
@@ -500,8 +513,8 @@ static struct ast_json *channel_connected_line(
 {
 	struct ast_json *json_channel;
 
-	/* No ChannelConnectedLine event on cache clear or first event */
-	if (!old_snapshot || !new_snapshot) {
+	/* No ChannelConnectedLine event on first channel snapshot */
+	if (!old_snapshot) {
 		return NULL;
 	}
 
@@ -532,39 +545,22 @@ static void sub_channel_update_handler(void *data,
 	struct stasis_message *message)
 {
 	struct stasis_app *app = data;
-	struct stasis_cache_update *update;
-	struct ast_channel_snapshot *new_snapshot;
-	struct ast_channel_snapshot *old_snapshot;
-	const struct timeval *tv;
+	struct ast_channel_snapshot_update *update = stasis_message_data(message);
 	int i;
-
-	ast_assert(stasis_message_type(message) == stasis_cache_update_type());
-
-	update = stasis_message_data(message);
-
-	ast_assert(update->type == ast_channel_snapshot_type());
-
-	new_snapshot = stasis_message_data(update->new_snapshot);
-	old_snapshot = stasis_message_data(update->old_snapshot);
-
-	/* Pull timestamp from the new snapshot, or from the update message
-	 * when there isn't one. */
-	tv = update->new_snapshot ?
-		stasis_message_timestamp(update->new_snapshot) :
-		stasis_message_timestamp(message);
 
 	for (i = 0; i < ARRAY_LEN(channel_monitors); ++i) {
 		struct ast_json *msg;
 
-		msg = channel_monitors[i](old_snapshot, new_snapshot, tv);
+		msg = channel_monitors[i](update->old_snapshot, update->new_snapshot,
+			stasis_message_timestamp(message));
 		if (msg) {
 			app_send(app, msg);
 			ast_json_unref(msg);
 		}
 	}
 
-	if (!new_snapshot && old_snapshot) {
-		unsubscribe(app, "channel", old_snapshot->uniqueid, 1);
+	if (ast_test_flag(&update->new_snapshot->flags, AST_FLAG_DEAD)) {
+		unsubscribe(app, "channel", update->new_snapshot->base->uniqueid, 1);
 	}
 }
 
@@ -689,33 +685,23 @@ static void sub_bridge_update_handler(void *data,
 {
 	struct ast_json *json = NULL;
 	struct stasis_app *app = data;
-	struct stasis_cache_update *update;
-	struct ast_bridge_snapshot *new_snapshot;
-	struct ast_bridge_snapshot *old_snapshot;
+	struct ast_bridge_snapshot_update *update;
 	const struct timeval *tv;
-
-	ast_assert(stasis_message_type(message) == stasis_cache_update_type());
 
 	update = stasis_message_data(message);
 
-	ast_assert(update->type == ast_bridge_snapshot_type());
+	tv = stasis_message_timestamp(message);
 
-	new_snapshot = stasis_message_data(update->new_snapshot);
-	old_snapshot = stasis_message_data(update->old_snapshot);
-	tv = update->new_snapshot ?
-		stasis_message_timestamp(update->new_snapshot) :
-		stasis_message_timestamp(message);
-
-	if (!new_snapshot) {
-		json = simple_bridge_event("BridgeDestroyed", old_snapshot, tv);
-	} else if (!old_snapshot) {
-		json = simple_bridge_event("BridgeCreated", new_snapshot, tv);
-	} else if (new_snapshot && old_snapshot
-		&& strcmp(new_snapshot->video_source_id, old_snapshot->video_source_id)) {
-		json = simple_bridge_event("BridgeVideoSourceChanged", new_snapshot, tv);
-		if (json && !ast_strlen_zero(old_snapshot->video_source_id)) {
+	if (!update->new_snapshot) {
+		json = simple_bridge_event("BridgeDestroyed", update->old_snapshot, tv);
+	} else if (!update->old_snapshot) {
+		json = simple_bridge_event("BridgeCreated", update->new_snapshot, tv);
+	} else if (update->new_snapshot && update->old_snapshot
+		&& strcmp(update->new_snapshot->video_source_id, update->old_snapshot->video_source_id)) {
+		json = simple_bridge_event("BridgeVideoSourceChanged", update->new_snapshot, tv);
+		if (json && !ast_strlen_zero(update->old_snapshot->video_source_id)) {
 			ast_json_object_set(json, "old_video_source_id",
-				ast_json_string_create(old_snapshot->video_source_id));
+				ast_json_string_create(update->old_snapshot->video_source_id));
 		}
 	}
 
@@ -724,8 +710,8 @@ static void sub_bridge_update_handler(void *data,
 		ast_json_unref(json);
 	}
 
-	if (!new_snapshot && old_snapshot) {
-		unsubscribe(app, "bridge", old_snapshot->uniqueid, 1);
+	if (!update->new_snapshot && update->old_snapshot) {
+		unsubscribe(app, "bridge", update->old_snapshot->uniqueid, 1);
 	}
 }
 
@@ -791,7 +777,7 @@ static void bridge_blind_transfer_handler(void *data, struct stasis_subscription
 	struct ast_blind_transfer_message *transfer_msg = stasis_message_data(message);
 	struct ast_bridge_snapshot *bridge = transfer_msg->bridge;
 
-	if (bridge_app_subscribed(app, transfer_msg->transferer->uniqueid) ||
+	if (bridge_app_subscribed(app, transfer_msg->transferer->base->uniqueid) ||
 		(bridge && bridge_app_subscribed_involved(app, bridge))) {
 		stasis_publish(app->topic, message);
 	}
@@ -804,9 +790,9 @@ static void bridge_attended_transfer_handler(void *data, struct stasis_subscript
 	struct ast_attended_transfer_message *transfer_msg = stasis_message_data(message);
 	int subscribed = 0;
 
-	subscribed = bridge_app_subscribed(app, transfer_msg->to_transferee.channel_snapshot->uniqueid);
+	subscribed = bridge_app_subscribed(app, transfer_msg->to_transferee.channel_snapshot->base->uniqueid);
 	if (!subscribed) {
-		subscribed = bridge_app_subscribed(app, transfer_msg->to_transfer_target.channel_snapshot->uniqueid);
+		subscribed = bridge_app_subscribed(app, transfer_msg->to_transfer_target.channel_snapshot->base->uniqueid);
 	}
 	if (!subscribed && transfer_msg->to_transferee.bridge_snapshot) {
 		subscribed = bridge_app_subscribed_involved(app, transfer_msg->to_transferee.bridge_snapshot);
@@ -821,16 +807,16 @@ static void bridge_attended_transfer_handler(void *data, struct stasis_subscript
 			subscribed = bridge_app_subscribed(app, transfer_msg->dest.bridge);
 			break;
 		case AST_ATTENDED_TRANSFER_DEST_LINK:
-			subscribed = bridge_app_subscribed(app, transfer_msg->dest.links[0]->uniqueid);
+			subscribed = bridge_app_subscribed(app, transfer_msg->dest.links[0]->base->uniqueid);
 			if (!subscribed) {
-				subscribed = bridge_app_subscribed(app, transfer_msg->dest.links[1]->uniqueid);
+				subscribed = bridge_app_subscribed(app, transfer_msg->dest.links[1]->base->uniqueid);
 			}
 			break;
 		break;
 		case AST_ATTENDED_TRANSFER_DEST_THREEWAY:
 			subscribed = bridge_app_subscribed_involved(app, transfer_msg->dest.threeway.bridge_snapshot);
 			if (!subscribed) {
-				subscribed = bridge_app_subscribed(app, transfer_msg->dest.threeway.channel_snapshot->uniqueid);
+				subscribed = bridge_app_subscribed(app, transfer_msg->dest.threeway.channel_snapshot->base->uniqueid);
 			}
 			break;
 		default:
@@ -843,7 +829,7 @@ static void bridge_attended_transfer_handler(void *data, struct stasis_subscript
 	}
 }
 
-static void bridge_default_handler(void *data, struct stasis_subscription *sub,
+static void bridge_subscription_change_handler(void *data, struct stasis_subscription *sub,
 	struct stasis_message *message)
 {
 	struct stasis_app *app = data;
@@ -931,6 +917,10 @@ struct stasis_app *app_create(const char *name, stasis_app_cb handler, void *dat
 	RAII_VAR(struct stasis_app *, app, NULL, ao2_cleanup);
 	size_t size;
 	int res = 0;
+	size_t context_size = strlen("stasis-") + strlen(name) + 1;
+	char context_name[context_size];
+	char *topic_name;
+	int ret;
 
 	ast_assert(name != NULL);
 	ast_assert(handler != NULL);
@@ -951,7 +941,13 @@ struct stasis_app *app_create(const char *name, stasis_app_cb handler, void *dat
 		return NULL;
 	}
 
-	app->topic = stasis_topic_create(name);
+	ret = ast_asprintf(&topic_name, "ari:application/%s", name);
+	if (ret < 0) {
+		return NULL;
+	}
+
+	app->topic = stasis_topic_create(topic_name);
+	ast_free(topic_name);
 	if (!app->topic) {
 		return NULL;
 	}
@@ -970,8 +966,8 @@ struct stasis_app *app_create(const char *name, stasis_app_cb handler, void *dat
 	res |= stasis_message_router_add(app->bridge_router,
 		ast_attended_transfer_type(), bridge_attended_transfer_handler, app);
 
-	res |= stasis_message_router_set_default(app->bridge_router,
-		bridge_default_handler, app);
+	res |= stasis_message_router_add(app->bridge_router,
+		stasis_subscription_change_type(), bridge_subscription_change_handler, app);
 
 	if (res != 0) {
 		return NULL;
@@ -984,17 +980,20 @@ struct stasis_app *app_create(const char *name, stasis_app_cb handler, void *dat
 		return NULL;
 	}
 
-	res |= stasis_message_router_add_cache_update(app->router,
+	res |= stasis_message_router_add(app->router,
 		ast_bridge_snapshot_type(), sub_bridge_update_handler, app);
 
-	res |= stasis_message_router_add_cache_update(app->router,
+	res |= stasis_message_router_add(app->router,
 		ast_channel_snapshot_type(), sub_channel_update_handler, app);
 
 	res |= stasis_message_router_add_cache_update(app->router,
 		ast_endpoint_snapshot_type(), sub_endpoint_update_handler, app);
 
-	res |= stasis_message_router_set_default(app->router,
-		sub_default_handler, app);
+	res |= stasis_message_router_add(app->router,
+		stasis_subscription_change_type(), sub_subscription_change_handler, app);
+
+	stasis_message_router_set_formatters_default(app->router,
+		sub_default_handler, app, STASIS_SUBSCRIPTION_FORMATTER_JSON);
 
 	if (res != 0) {
 		return NULL;
@@ -1005,6 +1004,22 @@ struct stasis_app *app_create(const char *name, stasis_app_cb handler, void *dat
 	strncpy(app->name, name, size - sizeof(*app));
 	app->handler = handler;
 	app->data = ao2_bump(data);
+
+	/* Create a context, a match-all extension, and a 'h' extension for this application. Note that
+	 * this should only be done if a context does not already exist. */
+	strcpy(context_name, "stasis-");
+	strcat(context_name, name);
+	if (!ast_context_find(context_name)) {
+		if (!ast_context_find_or_create(NULL, NULL, context_name, "res_stasis")) {
+			ast_log(LOG_WARNING, "Could not create context '%s' for Stasis application '%s'\n", context_name, name);
+		} else {
+			ast_add_extension(context_name, 0, "_.", 1, NULL, NULL, "Stasis", ast_strdup(name), ast_free_ptr, "res_stasis");
+			ast_add_extension(context_name, 0, "h", 1, NULL, NULL, "NoOp", NULL, NULL, "res_stasis");
+		}
+	} else {
+		ast_log(LOG_WARNING, "Not creating context '%s' for Stasis application '%s' because it already exists\n",
+			context_name, name);
+	}
 
 	ao2_ref(app, +1);
 	return app;
@@ -1605,4 +1620,120 @@ void stasis_app_unregister_event_sources(void)
 	stasis_app_unregister_event_source(&endpoint_event_source);
 	stasis_app_unregister_event_source(&bridge_event_source);
 	stasis_app_unregister_event_source(&channel_event_source);
+}
+
+struct ast_json *stasis_app_event_filter_to_json(struct stasis_app *app, struct ast_json *json)
+{
+	if (!app || !json) {
+		return json;
+	}
+
+	ast_json_object_set(json, "events_allowed", app->events_allowed ?
+		ast_json_ref(app->events_allowed) : ast_json_array_create());
+	ast_json_object_set(json, "events_disallowed", app->events_disallowed ?
+		ast_json_ref(app->events_disallowed) : ast_json_array_create());
+
+	return json;
+}
+
+static int app_event_filter_set(struct stasis_app *app,	struct ast_json **member,
+	struct ast_json *filter, const char *filter_type)
+{
+	if (filter && ast_json_typeof(filter) == AST_JSON_OBJECT) {
+		if (!ast_json_object_size(filter)) {
+			/* If no filters are specified then reset this filter type */
+			filter = NULL;
+		} else {
+			/* Otherwise try to get the filter array for this type */
+			filter = ast_json_object_get(filter, filter_type);
+			if (!filter) {
+				/* A filter type exists, but not this one, so don't update */
+				return 0;
+			}
+		}
+	}
+
+	/* At this point the filter object should be an array */
+	if (filter && ast_json_typeof(filter) != AST_JSON_ARRAY) {
+		ast_log(LOG_ERROR, "Invalid json type event filter - app: %s, filter: %s\n",
+				app->name, filter_type);
+		return -1;
+	}
+
+	if (filter) {
+		/* Confirm that at least the type names are specified */
+		struct ast_json *obj;
+		int i;
+
+		for (i = 0; i < ast_json_array_size(filter) &&
+				 (obj = ast_json_array_get(filter, i)); ++i) {
+
+			if (ast_strlen_zero(ast_json_object_string_get(obj, "type"))) {
+				ast_log(LOG_ERROR, "Filter event must have a type - app: %s, "
+						"filter: %s\n",	app->name, filter_type);
+				return -1;
+			}
+		}
+	}
+
+	ao2_lock(app);
+	ast_json_unref(*member);
+	*member = filter ? ast_json_ref(filter) : NULL;
+	ao2_unlock(app);
+
+	return 0;
+}
+
+static int app_events_allowed_set(struct stasis_app *app, struct ast_json *filter)
+{
+	return app_event_filter_set(app, &app->events_allowed, filter, "allowed");
+}
+
+static int app_events_disallowed_set(struct stasis_app *app, struct ast_json *filter)
+{
+	return app_event_filter_set(app, &app->events_disallowed, filter, "disallowed");
+}
+
+int stasis_app_event_filter_set(struct stasis_app *app, struct ast_json *filter)
+{
+	return app_events_disallowed_set(app, filter) || app_events_allowed_set(app, filter);
+}
+
+static int app_event_filter_matched(struct ast_json *array, struct ast_json *event, int empty)
+{
+	struct ast_json *obj;
+	int i;
+
+	if (!array || !ast_json_array_size(array)) {
+		return empty;
+	}
+
+	for (i = 0; i < ast_json_array_size(array) &&
+			(obj = ast_json_array_get(array, i)); ++i) {
+
+		if (ast_strings_equal(ast_json_object_string_get(obj, "type"),
+				ast_json_object_string_get(event, "type"))) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+int stasis_app_event_allowed(const char *app_name, struct ast_json *event)
+{
+	struct stasis_app *app = stasis_app_get_by_name(app_name);
+	int res;
+
+	if (!app) {
+		return 0;
+	}
+
+	ao2_lock(app);
+	res = !app_event_filter_matched(app->events_disallowed, event, 0) &&
+		app_event_filter_matched(app->events_allowed, event, 1);
+	ao2_unlock(app);
+	ao2_ref(app, -1);
+
+	return res;
 }

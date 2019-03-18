@@ -171,6 +171,11 @@ struct bridge_manager_controller {
 /*! Bridge manager controller. */
 static struct bridge_manager_controller *bridge_manager;
 
+struct ao2_container *ast_bridges(void)
+{
+	return ao2_bump(bridges);
+}
+
 /*!
  * \internal
  * \brief Request service for a bridge from the bridge manager.
@@ -650,25 +655,6 @@ static void bridge_handle_actions(struct ast_bridge *bridge)
 	}
 }
 
-static struct stasis_message *create_bridge_snapshot_message(struct ast_bridge *bridge)
-{
-	RAII_VAR(struct ast_bridge_snapshot *, snapshot, NULL, ao2_cleanup);
-
-	if (!ast_bridge_snapshot_type()) {
-		return NULL;
-	}
-
-	ast_bridge_lock(bridge);
-	snapshot = ast_bridge_snapshot_create(bridge);
-	ast_bridge_unlock(bridge);
-
-	if (!snapshot) {
-		return NULL;
-	}
-
-	return stasis_message_create(ast_bridge_snapshot_type(), snapshot);
-}
-
 static void destroy_bridge(void *obj)
 {
 	struct ast_bridge *bridge = obj;
@@ -677,17 +663,7 @@ static void destroy_bridge(void *obj)
 		bridge->uniqueid, bridge->v_table->name);
 
 	if (bridge->construction_completed) {
-		RAII_VAR(struct stasis_message *, clear_msg, NULL, ao2_cleanup);
-
-		clear_msg = create_bridge_snapshot_message(bridge);
-		if (clear_msg) {
-			RAII_VAR(struct stasis_message *, msg, NULL, ao2_cleanup);
-
-			msg = stasis_cache_clear_create(clear_msg);
-			if (msg) {
-				stasis_publish(ast_bridge_topic(bridge), msg);
-			}
-		}
+		bridge_topics_destroy(bridge);
 	}
 
 	/* Do any pending actions in the context of destruction. */
@@ -726,9 +702,8 @@ static void destroy_bridge(void *obj)
 
 	cleanup_video_mode(bridge);
 
-	stasis_cp_single_unsubscribe(bridge->topics);
-
 	ast_string_field_free_memory(bridge);
+	ao2_cleanup(bridge->current_snapshot);
 }
 
 struct ast_bridge *bridge_register(struct ast_bridge *bridge)
@@ -846,6 +821,8 @@ struct ast_bridge *bridge_base_init(struct ast_bridge *self, uint32_t capabiliti
 			return NULL;
 		}
 	}
+
+	self->creationtime = ast_tvnow();
 
 	return self;
 }
@@ -2007,6 +1984,9 @@ int ast_bridge_depart(struct ast_channel *chan)
 int ast_bridge_remove(struct ast_bridge *bridge, struct ast_channel *chan)
 {
 	struct ast_bridge_channel *bridge_channel;
+
+	ast_debug(1, "Removing channel %s from bridge %s\n",
+		ast_channel_name(chan), bridge->uniqueid);
 
 	ast_bridge_lock(bridge);
 
@@ -4018,6 +3998,13 @@ const char *ast_bridge_video_mode_to_string(enum ast_bridge_video_mode_type vide
 	}
 }
 
+void ast_bridge_set_send_sdp_label(struct ast_bridge *bridge, unsigned int send_sdp_label)
+{
+	ast_bridge_lock(bridge);
+	bridge->softmix.send_sdp_label = send_sdp_label;
+	ast_bridge_unlock(bridge);
+}
+
 static int channel_hash(const void *obj, int flags)
 {
 	const struct ast_channel *chan = obj;
@@ -4068,8 +4055,8 @@ struct ao2_container *ast_bridge_peers_nolock(struct ast_bridge *bridge)
 	struct ao2_container *channels;
 	struct ast_bridge_channel *iter;
 
-	channels = ao2_container_alloc_options(AO2_ALLOC_OPT_LOCK_NOLOCK,
-		13, channel_hash, channel_cmp);
+	channels = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_NOLOCK, 0,
+		13, channel_hash, NULL, channel_cmp);
 	if (!channels) {
 		return NULL;
 	}
@@ -5064,43 +5051,13 @@ static char *complete_bridge_live(const char *word)
 	return NULL;
 }
 
-static char *complete_bridge_stasis(const char *word)
-{
-	int wordlen = strlen(word);
-	struct ao2_container *cached_bridges;
-	struct ao2_iterator iter;
-	struct stasis_message *msg;
-
-	cached_bridges = stasis_cache_dump(ast_bridge_cache(), ast_bridge_snapshot_type());
-	if (!cached_bridges) {
-		return NULL;
-	}
-
-	iter = ao2_iterator_init(cached_bridges, 0);
-	for (; (msg = ao2_iterator_next(&iter)); ao2_ref(msg, -1)) {
-		struct ast_bridge_snapshot *snapshot = stasis_message_data(msg);
-
-		if (!strncasecmp(word, snapshot->uniqueid, wordlen)) {
-			if (ast_cli_completion_add(ast_strdup(snapshot->uniqueid))) {
-				ao2_ref(msg, -1);
-				break;
-			}
-		}
-	}
-	ao2_iterator_destroy(&iter);
-	ao2_ref(cached_bridges, -1);
-
-	return NULL;
-}
-
 static char *handle_bridge_show_all(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
-#define FORMAT_HDR "%-36s %5s %-15s %s\n"
-#define FORMAT_ROW "%-36s %5u %-15s %s\n"
+#define FORMAT_HDR "%-36s %5s %-15s %-15s %s\n"
+#define FORMAT_ROW "%-36s %5u %-15s %-15s %s\n"
 
-	RAII_VAR(struct ao2_container *, cached_bridges, NULL, ao2_cleanup);
 	struct ao2_iterator iter;
-	struct stasis_message *msg;
+	struct ast_bridge *bridge;
 
 	switch (cmd) {
 	case CLI_INIT:
@@ -5113,25 +5070,27 @@ static char *handle_bridge_show_all(struct ast_cli_entry *e, int cmd, struct ast
 		return NULL;
 	}
 
-	cached_bridges = stasis_cache_dump(ast_bridge_cache(), ast_bridge_snapshot_type());
-	if (!cached_bridges) {
-		ast_cli(a->fd, "Failed to retrieve cached bridges\n");
-		return CLI_SUCCESS;
-	}
+	ast_cli(a->fd, FORMAT_HDR, "Bridge-ID", "Chans", "Type", "Technology", "Duration");
 
-	ast_cli(a->fd, FORMAT_HDR, "Bridge-ID", "Chans", "Type", "Technology");
+	iter = ao2_iterator_init(bridges, 0);
+	for (; (bridge = ao2_iterator_next(&iter)); ao2_ref(bridge, -1)) {
+		struct ast_bridge_snapshot *snapshot = ast_bridge_get_snapshot(bridge);
+		char print_time[32];
 
-	iter = ao2_iterator_init(cached_bridges, 0);
-	for (; (msg = ao2_iterator_next(&iter)); ao2_ref(msg, -1)) {
-		struct ast_bridge_snapshot *snapshot = stasis_message_data(msg);
+		ast_format_duration_hh_mm_ss(ast_tvnow().tv_sec - snapshot->creationtime.tv_sec, print_time, sizeof(print_time));
 
-		ast_cli(a->fd, FORMAT_ROW,
-			snapshot->uniqueid,
-			snapshot->num_channels,
-			S_OR(snapshot->subclass, "<unknown>"),
-			S_OR(snapshot->technology, "<unknown>"));
+		if (snapshot) {
+			ast_cli(a->fd, FORMAT_ROW,
+				snapshot->uniqueid,
+				snapshot->num_channels,
+				S_OR(snapshot->subclass, "<unknown>"),
+				S_OR(snapshot->technology, "<unknown>"),
+				print_time);
+			ao2_ref(snapshot, -1);
+		}
 	}
 	ao2_iterator_destroy(&iter);
+
 	return CLI_SUCCESS;
 
 #undef FORMAT_HDR
@@ -5143,24 +5102,23 @@ static int bridge_show_specific_print_channel(void *obj, void *arg, int flags)
 {
 	const char *uniqueid = obj;
 	struct ast_cli_args *a = arg;
-	RAII_VAR(struct stasis_message *, msg, NULL, ao2_cleanup);
 	struct ast_channel_snapshot *snapshot;
 
-	msg = stasis_cache_get(ast_channel_cache(), ast_channel_snapshot_type(), uniqueid);
-	if (!msg) {
+	snapshot = ast_channel_snapshot_get_latest(uniqueid);
+	if (!snapshot) {
 		return 0;
 	}
-	snapshot = stasis_message_data(msg);
 
-	ast_cli(a->fd, "Channel: %s\n", snapshot->name);
+	ast_cli(a->fd, "Channel: %s\n", snapshot->base->name);
+	ao2_ref(snapshot, -1);
 
 	return 0;
 }
 
 static char *handle_bridge_show_specific(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
-	RAII_VAR(struct stasis_message *, msg, NULL, ao2_cleanup);
 	struct ast_bridge_snapshot *snapshot;
+	char print_time[32];
 
 	switch (cmd) {
 	case CLI_INIT:
@@ -5171,7 +5129,7 @@ static char *handle_bridge_show_specific(struct ast_cli_entry *e, int cmd, struc
 		return NULL;
 	case CLI_GENERATE:
 		if (a->pos == 2) {
-			return complete_bridge_stasis(a->word);
+			return complete_bridge_live(a->word);
 		}
 		return NULL;
 	}
@@ -5180,18 +5138,26 @@ static char *handle_bridge_show_specific(struct ast_cli_entry *e, int cmd, struc
 		return CLI_SHOWUSAGE;
 	}
 
-	msg = stasis_cache_get(ast_bridge_cache(), ast_bridge_snapshot_type(), a->argv[2]);
-	if (!msg) {
+	snapshot = ast_bridge_get_snapshot_by_uniqueid(a->argv[2]);
+	if (!snapshot) {
 		ast_cli(a->fd, "Bridge '%s' not found\n", a->argv[2]);
 		return CLI_SUCCESS;
 	}
 
-	snapshot = stasis_message_data(msg);
+	ast_format_duration_hh_mm_ss(ast_tvnow().tv_sec - snapshot->creationtime.tv_sec, print_time, sizeof(print_time));
+
 	ast_cli(a->fd, "Id: %s\n", snapshot->uniqueid);
 	ast_cli(a->fd, "Type: %s\n", S_OR(snapshot->subclass, "<unknown>"));
 	ast_cli(a->fd, "Technology: %s\n", S_OR(snapshot->technology, "<unknown>"));
+	ast_cli(a->fd, "Subclass: %s\n", snapshot->subclass);
+	ast_cli(a->fd, "Creator: %s\n", snapshot->creator);
+	ast_cli(a->fd, "Name: %s\n", snapshot->name);
+	ast_cli(a->fd, "Video-Source-Id: %s\n", snapshot->video_source_id);
 	ast_cli(a->fd, "Num-Channels: %u\n", snapshot->num_channels);
+	ast_cli(a->fd, "Num-Active: %u\n", snapshot->num_active);
+	ast_cli(a->fd, "Duration: %s\n", print_time);
 	ao2_callback(snapshot->channels, OBJ_NODATA, bridge_show_specific_print_channel, a);
+	ao2_ref(snapshot, -1);
 
 	return CLI_SUCCESS;
 }

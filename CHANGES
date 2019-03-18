@@ -9,6 +9,207 @@
 ==============================================================================
 
 ------------------------------------------------------------------------------
+--- Functionality changes from Asterisk 16 to Asterisk 17 --------------------
+------------------------------------------------------------------------------
+
+chan_sip
+------------------
+ * The chan_sip module is now deprecated, users should migrate to the
+   replacement module chan_pjsip.  See guides at the Asterisk Wiki:
+     https://wiki.asterisk.org/wiki/x/tAHOAQ
+     https://wiki.asterisk.org/wiki/x/hYCLAQ
+
+Channels
+------------------
+ * The core no longer uses the stasis cache for channels snapshots.
+   The following APIs are no longer available:
+       ast_channel_topic_cached()
+       ast_channel_topic_all_cached()
+   The ast_channel_cache_all() and ast_channel_cache_by_name() functions
+   now returns an ao2_container of ast_channel_snapshots rather than a
+   container of stasis_messages therefore you can't call stasis_cache
+   functions on it.
+   The ast_channel_topic_all() function now returns a normal topic,
+   not a cached one so you can't use stasis cache functions on it either.
+   The ast_channel_snapshot_type() stasis message now has the
+   ast_channel_snapshot_update structure as it's data.
+   ast_channel_snapshot_get_latest() still returns the latest snapshot.
+
+Bridging
+------------------
+ * The bridging core no longer uses the stasis cache for bridge
+   snapshots.  The latest bridge snapshot is now stored on the
+   ast_bridge structure itself.
+
+ * The following APIs are no longer available since the stasis cache
+   is no longer used:
+     ast_bridge_topic_cached()
+     ast_bridge_topic_all_cached()
+
+ * A topic pool is now used for individual bridge topics.
+
+ * The ast_bridge_cache() function was removed since there's no
+   longer a separate container of snapshots.
+
+ * A new function "ast_bridges()" was created to retrieve the
+   container of all bridges.  Users formerly calling
+   ast_bridge_cache() can use the new function to iterate over
+   bridges and retrieve the latest snapshot directly from the
+   bridge.
+
+ * The ast_bridge_snapshot_get_latest() function was renamed to
+   ast_bridge_get_snapshot_by_uniqueid().
+
+ * A new function "ast_bridge_get_snapshot()" was created to retrieve
+   the bridge snapshot directly from the bridge structure.
+
+ * The ast_bridge_topic_all() function now returns a normal topic
+   not a cached one so you can't use stasis cache functions on it
+   either.
+
+ * The ast_bridge_snapshot_type() stasis message now has the
+   ast_bridge_snapshot_update structure as it's data.  It contains
+   the last snapshot and the new one.
+
+------------------------------------------------------------------------------
+--- Functionality changes from Asterisk 16.2.0 to Asterisk 16.3.0 ----------
+------------------------------------------------------------------------------
+
+ARI
+------------------
+ * Application event filtering is now supported. An application can now specify
+   an "allowed" and/or "disallowed" list(s) of event types. Only those types
+   indicated in the "allowed" list are sent to the application. Conversely, any
+   types defined in the "disallowed" list are not sent to the application. Note
+   that if a type is specified in both lists "disallowed" takes precedence.
+
+ * A new REST API call has been added: 'move'. It follows the format
+   'channels/{channelId}/move' and can be used to move channels from one application
+   to another without needing to exit back into the dialplan. An application must be
+   specified, but the passing a list of arguments to the new application is optional.
+   An example call would look like this:
+
+   client.channels.move(channelId=chan.id, app='ari-example', appArgs='a,b,c')
+
+   If the channel was inside of a bridge when switching applications, it will
+   remain there. If the application specified cannot be moved to, then the channel
+   will remain in the current application and an event will be triggered named
+   "ApplicationMoveFailed", which will provide the destination application's name
+   and the channel information.
+
+res_pjsip
+------------------
+ * A new configuration parameter "taskprocessor_overload_trigger" has been
+   added to the pjsip.conf "globals" section.  The distributor currently stops
+   accepting new requests when any taskprocessor overload is triggered.  The
+   new option allows you to completely disable overload detection (NOT
+   RECOMMENDED), keep the current behavior, or trigger only on pjsip
+   taskprocessor overloads.
+
+chan_pjsip
+------------------
+ * A new configuration parameter 'ignore_183_without_sdp' has been added
+   to the pjsip.conf "endpoints" section.  If enabled, will make chan_pjsip
+   discard 183s that do not contain an SDP body, which can resolve no
+   ringback tone issues as well as making the behavior match chan_sip.
+
+MWI
+------------------
+ * A new module "res_mwi_devstate" has been added that allows subscriptions
+   to voicemail boxes using "presence" events.  This allows common BLF keys
+   to act as voicemail waiting indicators.
+
+app_queue
+------------------
+ * Added the ability to set the wrapuptime per-member using the AddQueueMember
+   application.
+
+------------------------------------------------------------------------------
+--- Functionality changes from Asterisk 16.1.0 to Asterisk 16.2.0 ------------
+------------------------------------------------------------------------------
+
+ARI
+------------------
+ * Whenever an ARI application is started, a context will be created for it
+   automatically as long as one does not already exist, following the format
+   'stasis-<app_name>'. Two extensions are also added to this context: a match-all
+   extension, and the 'h' extension. Any phone that registers under this context
+   will place all calls to the corresponding Stasis application.
+
+res_pjsip
+------------------
+ * Added "send_contact_status_on_update_registration" global configuration option
+   to enable sending AMI ContactStatus event when a device refreshes its registration.
+
+Core
+------------------
+ * Reworked the media indexer so it doesn't cache the index.  Testing revealed
+   that the cache added no benefit but that it could consume excessive memory.
+   Two new index related functions were created: ast_sounds_get_index_for_file()
+   and ast_media_index_update_for_file() which restrict index updating to
+   specific sound files.  The original ast_sounds_get_index() and
+   ast_media_index_update() calls are still available but since they no longer
+   cache the results internally, developers should re-use an index they may
+   already have instead of calling ast_sounds_get_index() repeatedly.  If
+   information for only a single file is needed, ast_sounds_get_index_for_file()
+   should be called instead of ast_sounds_get_index().
+
+Features
+------------------
+ * Before Asterisk 12, when using the automon or automixmon features defined
+   in features.conf, a channel variable (TOUCH_MIXMONITOR_OUTPUT) was set on
+   both channels, indicating the filename of the recording.
+
+   When bridging was overhauled in Asterisk 12, the behavior was changed such
+   that the variable was only set on the peer channel and not on the channel
+   that initiated the automon or automixmon.
+
+   The previous behavior has been restored so both channels receive the
+   channel variable when one of these features is invoked.
+
+app_voicemail
+------------------
+ * You can now specify a special context with the "aliasescontext" parameter
+   in voicemail.conf which will allow you to create aliases for physical
+   mailboxes.
+
+------------------------------------------------------------------------------
+--- Functionality changes from Asterisk 16.0.0 to Asterisk 16.1.0 ------------
+------------------------------------------------------------------------------
+
+pbx_config
+------------------
+ * pbx_config will now find and process multiple 'globals' sections from
+   extensions.conf.  Variables are processed in the order they are found
+   and duplicate variables overwrite the previous value.
+
+chan_pjsip
+------------------
+ * New dialplan function PJSIP_PARSE_URI added to parse an URI and return
+   a specified part of the URI.
+
+Core
+------------------
+ * ast_bt_get_symbols() now returns a vector of strings instead of an
+   array of strings.  This must be freed with ast_bt_free_symbols.
+
+res_pjsip
+------------------
+ * New options 'trust_connected_line' and 'send_connected_line' have been
+   added to the endpoint. The option 'trust_connected_line' is to control
+   if connected line updates are accepted from this endpoint.
+   The option 'send_connected_line' is to control if connected line updates
+   can be sent to this endpoint.
+   The default value is 'yes' for both options.
+
+res_rtp_asterisk
+------------------
+ * The existing strictrtp option in rtp.conf has a new choice availabe, called
+   'seqno', which behaves the same way as setting strictrtp to 'yes', but will
+   ignore the time interval during learning so that bursts of packets can still
+   trigger learning our source.
+
+------------------------------------------------------------------------------
 --- Functionality changes from Asterisk 15 to Asterisk 16 --------------------
 ------------------------------------------------------------------------------
 
@@ -31,11 +232,19 @@ Build System
    MALLOC_DEBUG and vice versa.  Third-party pre-compiled modules no longer
    need to have a special build with it enabled.
 
+ * Asterisk now depends on libjansson >= 2.11.  If this version is not
+   available on your distro you can use `./configure --with-jansson-bundled`.
+
 app_macro
 ------------------
  * The app_macro module is now deprecated and by default it is no longer
    built.  Users should migrate to app_stack (Gosub).  A warning is logged
    the first time any Macro is used.
+
+app_setcallerid
+------------------
+ * The app_setcallerid module has been removed. The CALLERID dialplan function
+   should be used instead.
 
 chan_sip
 ------------------
@@ -56,6 +265,10 @@ AMI
    and ContactStatusDetail are now set to "NonQualified" when a contact exists
    but has not been qualified.
 
+ * The "Newexten" event is now part of the "dialplan" class. The documentation
+   for Asterisk 15 already specified this, but the implementation was actually
+   using the "call" class instead.
+
 ARI
 ------------------
  * The ContactInfo event's contact_status field is now set to "NonQualified"
@@ -66,6 +279,10 @@ app_queue
  * Added the ability to set the wrapuptime in the configuration of member.
    When set the wrapuptime on the member is used instead of the wrapuptime
    defined for the queue itself.
+
+ * Added predial handler support for caller and callee channels with the
+   B and b options respectively.  This is similar to the predial support
+   in app_dial.
 
 res_config_sqlite
 ------------------
@@ -104,10 +321,50 @@ cdr_syslog
  * The cdr_syslog module is now deprecated and by default it is no longer
    built.
 
+cdr_sqlite
+------------------
+ * The cdr_sqlite module has been removed. Users should move to using the
+   cdr_sqlite3_custom module instead.
+
+format_jpeg
+------------------
+ * The format_jpeg module has been removed.
+
+pbx_dundi
+------------------
+ * DUNDi now supports IPv6
+
 Core:
 ------------------
  * libedit is no longer available as an embedded library and must be provided
    by the system.
+ * The STATIC_BUILD functionality has been removed as it has not been maintained
+   and has not worked in quite some time.
+ * The module loader now enforces inter-module dependencies.  This ensures that
+   a module is not started before another it depends on, even if preload is used.
+   If a dependency is not available or fails to startup this will block any
+   dependants from startup.
+ * Parts of the Asterisk core which can load configuration from realtime are now
+   built-in modules.  It is no longer necessary to preload realtime drivers as
+   they are always initialized before the built-in modules.
+
+------------------------------------------------------------------------------
+--- Functionality changes from Asterisk 15.5.0 to Asterisk 15.6.0 ------------
+------------------------------------------------------------------------------
+
+res_pjsip
+------------------
+ * A new option 'suppress_q850_reason_headers' has been added to the endpoint
+   object. Some devices can't accept multiple Reason headers and get confused
+   when both 'SIP' and 'Q.850' Reason headers are received.  This option allows
+   the 'Q.850' Reason header to be suppressed.  The default value is 'no'.
+
+res_pjsip_endpoint_identifier_ip
+------------------
+ * Added regex support to the identify section match_header option.  You
+   specify a regex instead of an explicit string by surrounding the header
+   value with slashes:
+   match_header = SIPHeader: /regex/
 
 ------------------------------------------------------------------------------
 --- Functionality changes from Asterisk 15.4.0 to Asterisk 15.5.0 ------------
@@ -124,16 +381,46 @@ Core
 
 app_sendtext
 ------------------
-    Support Enhanced Messaging.  SendText now accepts new channel variables
-    that can be used to override the To and From display names and set the
-    Content-Type of a message.  Since you can now set Content-Type, other
-    text/* content types are now valid.
+ * Support Enhanced Messaging.  SendText now accepts new channel variables
+   that can be used to override the To and From display names and set the
+   Content-Type of a message.  Since you can now set Content-Type, other
+   text/* content types are now valid.
 
 app_confbridge
 ------------------
-  * ConfbridgeList now shows talking status. This utilizes the same voice
-    detection as the ConfbridgeTalking event, so bridges must be configured
-    with "talk_detection_events=yes" for this flag to have meaning.
+ * ConfbridgeList now shows talking status. This utilizes the same voice
+   detection as the ConfbridgeTalking event, so bridges must be configured
+   with "talk_detection_events=yes" for this flag to have meaning.
+
+ * ConfBridge can now send events to participants via in-dialog MESSAGEs.
+   All current Confbridge events are supported, such as ConfbridgeJoin,
+   ConfbridgeLeave, etc.  In addition to those events, a new event
+   ConfbridgeWelcome has been added that will send a list of all
+   current participants to a new participant.
+
+res_pjsip
+------------------
+  * Two new options have been added to the system and endpoint objects to
+    control whether, on outbound calls, Asterisk will accept updated SDP answers
+    during the initial INVITE transaction when 100rel is not in effect.
+    This usually happens when the INVITE is forked to multiple UASs and more
+    than one sends an SDP answer or when a single UAS needs to change a media
+    port to switch from custom ringback to the actual media destination.
+
+    The 'follow_early_media_forked' option sets whether Asterisk will accept
+    the updated SDP when the To tag on the subsequent response is different than
+    that on the the previous response.  This usually occurs in the forked INVITE
+    scenario. The default value is "yes" which is the current behavior.
+
+    The 'accept_multiple_sdp_answers' flag sets whether Asterisk will accept the
+    updated SDP when the To tag on the subsequent response is the same as that
+    on the previous response. This can occur when a UAS needs to switch media
+    ports from custom ringback to the final media path.  The default value is
+    "no" which is the current behavior.
+
+    These options have to be enabled system-wide in the system config section
+    of pjsip.conf as well as on individual endpoints that require the
+    functionality.
 
 ------------------------------------------------------------------------------
 --- Functionality changes from Asterisk 15.3.0 to Asterisk 15.4.0 ------------

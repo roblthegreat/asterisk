@@ -23,11 +23,10 @@
  * the validator's function pointer.
  *
  * The reason for this seamingly useless indirection is the way function
- * pointers interfere with module loading. Asterisk attempts to dlopen() each
- * module using \c RTLD_LAZY in order to read some metadata from the module.
- * Unfortunately, if you take the address of a function, the function has to be
- * resolvable at load time, even if \c RTLD_LAZY is specified. By moving the
- * function-address-taking into this module, we can once again be lazy.
+ * pointers used to interfere with module loading. Previously, Asterisk
+ * attempted to dlopen() each module using \c RTLD_LAZY in order to read some
+ * metadata from the module. Using functions to get the function pointer
+ * allowed us to be lazy.
  */
 
  /*
@@ -169,6 +168,24 @@ int ast_ari_validate_asterisk_info(struct ast_json *json);
  * See \ref ast_ari_model_validators.h for more details.
  */
 ari_validator ast_ari_validate_asterisk_info_fn(void);
+
+/*!
+ * \brief Validator for AsteriskPing.
+ *
+ * Asterisk ping information
+ *
+ * \param json JSON object to validate.
+ * \returns True (non-zero) if valid.
+ * \returns False (zero) if invalid.
+ */
+int ast_ari_validate_asterisk_ping(struct ast_json *json);
+
+/*!
+ * \brief Function pointer to ast_ari_validate_asterisk_ping().
+ *
+ * See \ref ast_ari_model_validators.h for more details.
+ */
+ari_validator ast_ari_validate_asterisk_ping_fn(void);
 
 /*!
  * \brief Validator for BuildInfo.
@@ -605,6 +622,24 @@ int ast_ari_validate_mailbox(struct ast_json *json);
  * See \ref ast_ari_model_validators.h for more details.
  */
 ari_validator ast_ari_validate_mailbox_fn(void);
+
+/*!
+ * \brief Validator for ApplicationMoveFailed.
+ *
+ * Notification that trying to move a channel to another Stasis application failed.
+ *
+ * \param json JSON object to validate.
+ * \returns True (non-zero) if valid.
+ * \returns False (zero) if invalid.
+ */
+int ast_ari_validate_application_move_failed(struct ast_json *json);
+
+/*!
+ * \brief Function pointer to ast_ari_validate_application_move_failed().
+ *
+ * See \ref ast_ari_model_validators.h for more details.
+ */
+ari_validator ast_ari_validate_application_move_failed_fn(void);
 
 /*!
  * \brief Validator for ApplicationReplaced.
@@ -1392,6 +1427,10 @@ ari_validator ast_ari_validate_application_fn(void);
  * - config: ConfigInfo
  * - status: StatusInfo
  * - system: SystemInfo
+ * AsteriskPing
+ * - asterisk_id: string (required)
+ * - ping: string (required)
+ * - timestamp: string (required)
  * BuildInfo
  * - date: string (required)
  * - kernel: string (required)
@@ -1467,6 +1506,7 @@ ari_validator ast_ari_validate_application_fn(void);
  * - bridge_class: string (required)
  * - bridge_type: string (required)
  * - channels: List[string] (required)
+ * - creationtime: Date (required)
  * - creator: string (required)
  * - id: string (required)
  * - name: string (required)
@@ -1506,6 +1546,14 @@ ari_validator ast_ari_validate_application_fn(void);
  * - name: string (required)
  * - new_messages: int (required)
  * - old_messages: int (required)
+ * ApplicationMoveFailed
+ * - asterisk_id: string
+ * - type: string (required)
+ * - application: string (required)
+ * - timestamp: Date
+ * - args: List[string] (required)
+ * - channel: Channel (required)
+ * - destination: string (required)
  * ApplicationReplaced
  * - asterisk_id: string
  * - type: string (required)
@@ -1809,6 +1857,8 @@ ari_validator ast_ari_validate_application_fn(void);
  * - channel_ids: List[string] (required)
  * - device_names: List[string] (required)
  * - endpoint_ids: List[string] (required)
+ * - events_allowed: List[object] (required)
+ * - events_disallowed: List[object] (required)
  * - name: string (required)
  */
 

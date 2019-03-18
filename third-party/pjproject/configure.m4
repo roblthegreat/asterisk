@@ -49,14 +49,31 @@ AC_DEFUN([_PJPROJECT_CONFIGURE],
 	AC_ARG_VAR([PJPROJECT_CONFIGURE_OPTS],[Additional configure options to pass to bundled pjproject])
 	this_host=$(./config.sub $(./config.guess))
 	if test "$build" != "$this_host" ; then
-		PJPROJECT_CONFIGURE_OPTS+=" --build=$build"
+		PJPROJECT_CONFIGURE_OPTS+=" --build=$build_alias"
 	fi
 	if test "$host" != "$this_host" ; then
-		PJPROJECT_CONFIGURE_OPTS+=" --host=$host"
+		PJPROJECT_CONFIGURE_OPTS+=" --host=$host_alias"
+	fi
+	# This was a copy of the autoconf generated code from the root ./configure.
+	# Hopefully, when you read this, the code is still the same.
+	if test "${with_ssl+set}" = set; then :
+		case $with_ssl in
+		n|no)
+		PJPROJECT_CONFIGURE_OPTS+=" --disable-ssl"
+		;;
+		y|ye|yes)
+		# This is the default value in PJProject and means "autodetect".
+		# In Asterisk, "./configure --with-ssl" means "must be present".
+		PJPROJECT_CONFIGURE_OPTS+=" --enable-ssl"
+		;;
+		*)
+		PJPROJECT_CONFIGURE_OPTS+=" --with-ssl=${with_ssl}"
+		;;
+		esac
 	fi
 
 	export TAR PATCH SED NM EXTERNALS_CACHE_DIR AST_DOWNLOAD_CACHE DOWNLOAD_TO_STDOUT DOWNLOAD_TIMEOUT DOWNLOAD MD5 CAT CUT GREP
-	export NOISY_BUILD
+	export NOISY_BUILD AST_DEVMODE
 	${GNU_MAKE} --quiet --no-print-directory -C ${PJPROJECT_DIR} \
 		PJPROJECT_CONFIGURE_OPTS="$PJPROJECT_CONFIGURE_OPTS" \
 		EXTERNALS_CACHE_DIR="${EXTERNALS_CACHE_DIR:-${AST_DOWNLOAD_CACHE}}" \
@@ -87,6 +104,10 @@ AC_DEFUN([_PJPROJECT_CONFIGURE],
 	AC_DEFINE([HAVE_PJSIP_INV_SESSION_REF], 1, [Define if your system has PJSIP_INV_SESSION_REF])
 	AC_DEFINE([HAVE_PJSIP_AUTH_CLT_DEINIT], 1, [Define if your system has pjsip_auth_clt_deinit declared.])
 	AC_DEFINE([HAVE_PJSIP_TSX_LAYER_FIND_TSX2], 1, [Define if your system has pjsip_tsx_layer_find_tsx2 declared.])
+	AC_DEFINE([HAVE_PJSIP_INV_ACCEPT_MULTIPLE_SDP_ANSWERS], 1, [Define if your system has HAVE_PJSIP_INV_ACCEPT_MULTIPLE_SDP_ANSWERS declared.])
+	AC_DEFINE([HAVE_PJSIP_ENDPOINT_COMPACT_FORM], 1, [Define if your system has HAVE_PJSIP_ENDPOINT_COMPACT_FORM declared.])
+	AC_DEFINE([HAVE_PJSIP_TRANSPORT_DISABLE_CONNECTION_REUSE], 1, [Define if your system has HAVE_PJSIP_TRANSPORT_DISABLE_CONNECTION_REUSE declared])
+	AC_DEFINE([HAVE_PJSIP_OAUTH_AUTHENTICATION], 1, [Define if your system has HAVE_PJSIP_OAUTH_AUTHENTICATION declared])
 
 	AC_SUBST([PJPROJECT_BUNDLED])
 	AC_SUBST([PJPROJECT_DIR])

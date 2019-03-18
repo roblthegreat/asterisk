@@ -170,8 +170,8 @@ void ast_ari_channels_continue_in_dialplan(
 	}
 
 	if (ast_strlen_zero(args->context)) {
-		context = snapshot->context;
-		exten = S_OR(args->extension, snapshot->exten);
+		context = snapshot->dialplan->context;
+		exten = S_OR(args->extension, snapshot->dialplan->exten);
 	} else {
 		context = args->context;
 		exten = S_OR(args->extension, "s");
@@ -203,7 +203,7 @@ void ast_ari_channels_continue_in_dialplan(
 		ipri = args->priority;
 	} else if (ast_strlen_zero(args->context) && ast_strlen_zero(args->extension)) {
 		/* Special case. No exten, context, or priority provided, then move on to the next priority */
-		ipri = snapshot->priority + 1;
+		ipri = snapshot->dialplan->priority + 1;
 	} else {
 		ipri = 1;
 	}
@@ -211,6 +211,26 @@ void ast_ari_channels_continue_in_dialplan(
 
 	if (stasis_app_control_continue(control, context, exten, ipri)) {
 		ast_ari_response_alloc_failed(response);
+		return;
+	}
+
+	ast_ari_response_no_content(response);
+}
+
+void ast_ari_channels_move(struct ast_variable *headers,
+	struct ast_ari_channels_move_args *args,
+	struct ast_ari_response *response)
+{
+	RAII_VAR(struct stasis_app_control *, control, NULL, ao2_cleanup);
+
+	control = find_control(response, args->channel_id);
+	if (!control) {
+		return;
+	}
+
+	if (stasis_app_control_move(control, args->app, args->app_args)) {
+		ast_ari_response_error(response, 500, "Internal Server Error",
+			"Failed to switch Stasis applications");
 		return;
 	}
 
@@ -263,10 +283,10 @@ void ast_ari_channels_redirect(struct ast_variable *headers,
 		return;
 	}
 
-	if (strncasecmp(chan_snapshot->type, tech, tech_len)) {
+	if (strncasecmp(chan_snapshot->base->type, tech, tech_len)) {
 		ast_ari_response_error(response, 422, "Unprocessable Entity",
 			"Endpoint technology '%s' does not match channel technology '%s'",
-			tech, chan_snapshot->type);
+			tech, chan_snapshot->base->type);
 		return;
 	}
 
@@ -628,7 +648,7 @@ static void ari_channels_handle_play(
 		return;
 	}
 
-	language = S_OR(args_lang, snapshot->language);
+	language = S_OR(args_lang, snapshot->base->language);
 
 	playback = stasis_app_control_play_uri(control, args_media, args_media_count, language,
 		args_channel_id, STASIS_PLAYBACK_TARGET_CHANNEL, args_skipms, args_offsetms, args_playback_id);
@@ -833,32 +853,19 @@ void ast_ari_channels_get(struct ast_variable *headers,
 	struct ast_ari_channels_get_args *args,
 	struct ast_ari_response *response)
 {
-	RAII_VAR(struct stasis_message *, msg, NULL, ao2_cleanup);
-	struct stasis_cache *cache;
 	struct ast_channel_snapshot *snapshot;
 
-	cache = ast_channel_cache();
-	if (!cache) {
-		ast_ari_response_error(
-			response, 500, "Internal Server Error",
-			"Message bus not initialized");
-		return;
-	}
-
-	msg = stasis_cache_get(cache, ast_channel_snapshot_type(),
-				   args->channel_id);
-	if (!msg) {
+	snapshot = ast_channel_snapshot_get_latest(args->channel_id);
+	if (!snapshot) {
 		ast_ari_response_error(
 			response, 404, "Not Found",
 			"Channel not found");
 		return;
 	}
 
-	snapshot = stasis_message_data(msg);
-	ast_assert(snapshot != NULL);
-
 	ast_ari_response_ok(response,
 				ast_channel_snapshot_to_json(snapshot, NULL));
+	ao2_ref(snapshot, -1);
 }
 
 void ast_ari_channels_hangup(struct ast_variable *headers,
@@ -884,6 +891,22 @@ void ast_ari_channels_hangup(struct ast_variable *headers,
 		cause = AST_CAUSE_CONGESTION;
 	} else if (!strcmp(args->reason, "no_answer")) {
 		cause = AST_CAUSE_NOANSWER;
+	} else if (!strcmp(args->reason, "timeout")) {
+		cause = AST_CAUSE_NO_USER_RESPONSE;
+	} else if (!strcmp(args->reason, "rejected")) {
+		cause = AST_CAUSE_CALL_REJECTED;
+	} else if (!strcmp(args->reason, "unallocated")) {
+		cause = AST_CAUSE_UNALLOCATED;
+	} else if (!strcmp(args->reason, "normal_unspecified")) {
+		cause = AST_CAUSE_NORMAL_UNSPECIFIED;
+	} else if (!strcmp(args->reason, "number_incomplete")) {
+		cause = AST_CAUSE_INVALID_NUMBER_FORMAT;
+	} else if (!strcmp(args->reason, "codec_mismatch")) {
+		cause = AST_CAUSE_BEARERCAPABILITY_NOTAVAIL;
+	} else if (!strcmp(args->reason, "interworking")) {
+		cause = AST_CAUSE_INTERWORKING;
+	} else if (!strcmp(args->reason, "failure")) {
+		cause = AST_CAUSE_FAILURE;
 	} else if(!strcmp(args->reason, "answered_elsewhere")) {
 		cause = AST_CAUSE_ANSWERED_ELSEWHERE;
 	} else {
@@ -903,27 +926,13 @@ void ast_ari_channels_list(struct ast_variable *headers,
 	struct ast_ari_channels_list_args *args,
 	struct ast_ari_response *response)
 {
-	RAII_VAR(struct stasis_cache *, cache, NULL, ao2_cleanup);
 	RAII_VAR(struct ao2_container *, snapshots, NULL, ao2_cleanup);
 	RAII_VAR(struct ast_json *, json, NULL, ast_json_unref);
 	struct ao2_iterator i;
 	void *obj;
 	struct stasis_message_sanitizer *sanitize = stasis_app_get_sanitizer();
 
-	cache = ast_channel_cache();
-	if (!cache) {
-		ast_ari_response_error(
-			response, 500, "Internal Server Error",
-			"Message bus not initialized");
-		return;
-	}
-	ao2_ref(cache, +1);
-
-	snapshots = stasis_cache_dump(cache, ast_channel_snapshot_type());
-	if (!snapshots) {
-		ast_ari_response_alloc_failed(response);
-		return;
-	}
+	snapshots = ast_channel_cache_all();
 
 	json = ast_json_array_create();
 	if (!json) {
@@ -933,12 +942,12 @@ void ast_ari_channels_list(struct ast_variable *headers,
 
 	i = ao2_iterator_init(snapshots, 0);
 	while ((obj = ao2_iterator_next(&i))) {
-		RAII_VAR(struct stasis_message *, msg, obj, ao2_cleanup);
-		struct ast_channel_snapshot *snapshot = stasis_message_data(msg);
+		struct ast_channel_snapshot *snapshot = obj;
 		int r;
 
 		if (sanitize && sanitize->channel_snapshot
 			&& sanitize->channel_snapshot(snapshot)) {
+			ao2_ref(snapshot, -1);
 			continue;
 		}
 
@@ -947,8 +956,10 @@ void ast_ari_channels_list(struct ast_variable *headers,
 		if (r != 0) {
 			ast_ari_response_alloc_failed(response);
 			ao2_iterator_destroy(&i);
+			ao2_ref(snapshot, -1);
 			return;
 		}
+		ao2_ref(snapshot, -1);
 	}
 	ao2_iterator_destroy(&i);
 
@@ -1748,15 +1759,21 @@ void ast_ari_channels_create(struct ast_variable *headers,
 	struct ast_format_cap *request_cap;
 	struct ast_channel *originator;
 
-	chan_data = ast_calloc(1, sizeof(*chan_data));
-	if (!chan_data) {
-		ast_ari_response_alloc_failed(response);
-		return;
-	}
-
 	if (!ast_strlen_zero(args->originator) && !ast_strlen_zero(args->formats)) {
 		ast_ari_response_error(response, 400, "Bad Request",
 			"Originator and formats can't both be specified");
+		return;
+	}
+
+	if (ast_strlen_zero(args->endpoint)) {
+		ast_ari_response_error(response, 400, "Bad Request",
+			"Endpoint must be specified");
+		return;
+	}
+
+	chan_data = ast_calloc(1, sizeof(*chan_data));
+	if (!chan_data) {
+		ast_ari_response_alloc_failed(response);
 		return;
 	}
 

@@ -189,6 +189,12 @@
 						</enumlist>
 					</description>
 				</configOption>
+				<configOption name="trust_connected_line">
+					<synopsis>Accept Connected Line updates from this endpoint</synopsis>
+				</configOption>
+				<configOption name="send_connected_line">
+					<synopsis>Send Connected Line updates to this endpoint</synopsis>
+				</configOption>
 				<configOption name="connected_line_method" default="invite">
 					<synopsis>Connected line method type</synopsis>
 					<description>
@@ -471,14 +477,17 @@
 					</para></description>
 				</configOption>
 				<configOption name="transport">
-					<synopsis>Desired transport configuration</synopsis>
-					<description><para>
-						This will set the desired transport configuration to send SIP data through.
+					<synopsis>Explicit transport configuration to use</synopsis>
+					<description>
+						<para>This will <emphasis>force</emphasis> the endpoint to use the
+						specified transport configuration to send SIP messages.  You need
+						to already know what kind of transport (UDP/TCP/IPv4/etc) the
+						endpoint device will use.
 						</para>
-						<warning><para>Not specifying a transport will <emphasis>DEFAULT</emphasis>
-						to the first configured transport in <filename>pjsip.conf</filename> which is
-						valid for the URI we are trying to contact.
-						</para></warning>
+						<note><para>Not specifying a transport will select the first
+						configured transport in <filename>pjsip.conf</filename> which is
+						compatible with the URI we are trying to contact.
+						</para></note>
 						<warning><para>Transport configuration is not affected by reloads. In order to
 						change transports, a full Asterisk restart is required</para></warning>
 					</description>
@@ -1080,6 +1089,54 @@
 						changes.  If not set, incoming MWI NOTIFYs are ignored.
 					</para></description>
 				</configOption>
+				<configOption name="follow_early_media_fork">
+					<synopsis>Follow SDP forked media when To tag is different</synopsis>
+					<description><para>
+						On outgoing calls, if the UAS responds with different SDP attributes
+						on subsequent 18X or 2XX responses (such as a port update) AND the
+						To tag on the subsequent response is different than that on the previous
+						one, follow it. This usually happens when the INVITE is forked to multiple
+						UASs and more than one sends an SDP answer.
+						</para>
+						<note><para>
+							This option must also be enabled in the <literal>system</literal>
+							section for it to take effect here.
+						</para></note>
+					</description>
+				</configOption>
+				<configOption name="accept_multiple_sdp_answers" default="no">
+					<synopsis>Accept multiple SDP answers on non-100rel responses</synopsis>
+					<description><para>
+						On outgoing calls, if the UAS responds with different SDP attributes
+						on non-100rel 18X or 2XX responses (such as a port update) AND the
+						To tag on the subsequent response is the same as that on the previous one,
+						process the updated SDP.  This can happen when the UAS needs to change ports
+						for some reason such as using a separate port for custom ringback.
+						</para>
+						<note><para>
+							This option must also be enabled in the <literal>system</literal>
+							section for it to take effect here.
+						</para></note>
+					</description>
+				</configOption>
+				<configOption name="suppress_q850_reason_headers" default="no">
+					<synopsis>Suppress Q.850 Reason headers for this endpoint</synopsis>
+					<description><para>
+						Some devices can't accept multiple Reason headers and get confused
+						when both 'SIP' and 'Q.850' Reason headers are received.  This
+						option allows the 'Q.850' Reason header to be suppressed.</para>
+					</description>
+				</configOption>
+				<configOption name="ignore_183_without_sdp" default="no">
+					<synopsis>Do not forward 183 when it doesn't contain SDP</synopsis>
+					<description><para>
+						Certain SS7 internetworking scenarios can result in a 183
+						to be generated for reasons other than early media.  Forwarding
+						this 183 can cause loss of ringback tone.  This flag emulates
+						the behavior of chan_sip and prevents these 183 responses from
+						being forwarded.</para>
+					</description>
+				</configOption>
 			</configObject>
 			<configObject name="auth">
 				<synopsis>Authentication type</synopsis>
@@ -1095,11 +1152,12 @@
 						This option specifies which of the password style config options should be read
 						when trying to authenticate an endpoint inbound request. If set to <literal>userpass</literal>
 						then we'll read from the 'password' option. For <literal>md5</literal> we'll read
-						from 'md5_cred'.
+						from 'md5_cred'. If set to <literal>google_oauth</literal> then we'll read from the refresh_token/oauth_clientid/oauth_secret fields.
 						</para>
 						<enumlist>
 							<enum name="md5"/>
 							<enum name="userpass"/>
+							<enum name="google_oauth"/>
 						</enumlist>
 					</description>
 				</configOption>
@@ -1113,6 +1171,15 @@
 				<configOption name="password">
 					<synopsis>Plain text password used for authentication.</synopsis>
 					<description><para>Only used when auth_type is <literal>userpass</literal>.</para></description>
+				</configOption>
+				<configOption name="refresh_token">
+					<synopsis>OAuth 2.0 refresh token</synopsis>
+				</configOption>
+				<configOption name="oauth_clientid">
+					<synopsis>OAuth 2.0 application's client id</synopsis>
+				</configOption>
+				<configOption name="oauth_secret">
+					<synopsis>OAuth 2.0 application's secret</synopsis>
 				</configOption>
 				<configOption name="realm">
 					<synopsis>SIP realm for endpoint</synopsis>
@@ -1181,13 +1248,13 @@
 					<synopsis>IP Address and optional port to bind to for this transport</synopsis>
 				</configOption>
 				<configOption name="ca_list_file">
-					<synopsis>File containing a list of certificates to read (TLS ONLY)</synopsis>
+					<synopsis>File containing a list of certificates to read (TLS ONLY, not WSS)</synopsis>
 				</configOption>
 				<configOption name="ca_list_path">
-					<synopsis>Path to directory containing a list of certificates to read (TLS ONLY)</synopsis>
+					<synopsis>Path to directory containing a list of certificates to read (TLS ONLY, not WSS)</synopsis>
 				</configOption>
 				<configOption name="cert_file">
-					<synopsis>Certificate file for endpoint (TLS ONLY)</synopsis>
+					<synopsis>Certificate file for endpoint (TLS ONLY, not WSS)</synopsis>
 					<description><para>
 						A path to a .crt or .pem file can be provided.  However, only
 						the certificate is read from the file, not the private key.
@@ -1196,7 +1263,7 @@
 					</para></description>
 				</configOption>
 				<configOption name="cipher">
-					<synopsis>Preferred cryptography cipher names (TLS ONLY)</synopsis>
+					<synopsis>Preferred cryptography cipher names (TLS ONLY, not WSS)</synopsis>
 					<description>
 					<para>Comma separated list of cipher names or numeric equivalents.
 						Numeric equivalents can be either decimal or hexadecimal (0xX).
@@ -1228,7 +1295,7 @@
 					<synopsis>External port for SIP signalling</synopsis>
 				</configOption>
 				<configOption name="method">
-					<synopsis>Method of SSL transport (TLS ONLY)</synopsis>
+					<synopsis>Method of SSL transport (TLS ONLY, not WSS)</synopsis>
 					<description>
 						<enumlist>
 							<enum name="default">
@@ -1255,7 +1322,7 @@
 					<synopsis>Password required for transport</synopsis>
 				</configOption>
 				<configOption name="priv_key_file">
-					<synopsis>Private key file (TLS ONLY)</synopsis>
+					<synopsis>Private key file (TLS ONLY, not WSS)</synopsis>
 				</configOption>
 				<configOption name="protocol" default="udp">
 					<synopsis>Protocol to use for SIP traffic</synopsis>
@@ -1266,20 +1333,21 @@
 							<enum name="tls" />
 							<enum name="ws" />
 							<enum name="wss" />
+							<enum name="flow" />
 						</enumlist>
 					</description>
 				</configOption>
 				<configOption name="require_client_cert" default="false">
-					<synopsis>Require client certificate (TLS ONLY)</synopsis>
+					<synopsis>Require client certificate (TLS ONLY, not WSS)</synopsis>
 				</configOption>
 				<configOption name="type">
 					<synopsis>Must be of type 'transport'.</synopsis>
 				</configOption>
 				<configOption name="verify_client" default="false">
-					<synopsis>Require verification of client certificate (TLS ONLY)</synopsis>
+					<synopsis>Require verification of client certificate (TLS ONLY, not WSS)</synopsis>
 				</configOption>
 				<configOption name="verify_server" default="false">
-					<synopsis>Require verification of server certificate (TLS ONLY)</synopsis>
+					<synopsis>Require verification of server certificate (TLS ONLY, not WSS)</synopsis>
 				</configOption>
 				<configOption name="tos" default="false">
 					<synopsis>Enable TOS for the signalling sent over this transport</synopsis>
@@ -1647,8 +1715,36 @@
 						request is too large.  See RFC 3261 section 18.1.1.
 					</para></description>
 				</configOption>
+				<configOption name="follow_early_media_fork">
+					<synopsis>Follow SDP forked media when To tag is different</synopsis>
+					<description><para>
+						On outgoing calls, if the UAS responds with different SDP attributes
+						on subsequent 18X or 2XX responses (such as a port update) AND the
+						To tag on the subsequent response is different than that on the previous
+						one, follow it.
+						</para>
+						<note><para>
+							This option must also be enabled on endpoints that require
+							this functionality.
+						</para></note>
+					</description>
+				</configOption>
+				<configOption name="accept_multiple_sdp_answers">
+					<synopsis>Follow SDP forked media when To tag is the same</synopsis>
+					<description><para>
+						On outgoing calls, if the UAS responds with different SDP attributes
+						on non-100rel 18X or 2XX responses (such as a port update) AND the
+						To tag on the subsequent response is the same as that on the previous one,
+						process the updated SDP.
+						</para>
+						<note><para>
+							This option must also be enabled on endpoints that require
+							this functionality.
+						</para></note>
+					</description>
+				</configOption>
 				<configOption name="type">
-					<synopsis>Must be of type 'system'.</synopsis>
+					<synopsis>Must be of type 'system' UNLESS the object name is 'system'.</synopsis>
 				</configOption>
 			</configObject>
 			<configObject name="global">
@@ -1660,7 +1756,7 @@
 				<configOption name="max_forwards" default="70">
 					<synopsis>Value used in Max-Forwards header for SIP requests.</synopsis>
 				</configOption>
-				<configOption name="keep_alive_interval" default="0">
+				<configOption name="keep_alive_interval" default="90">
 					<synopsis>The interval (in seconds) to send keepalives to active connection-oriented transports.</synopsis>
 				</configOption>
 				<configOption name="contact_expiration_check_interval" default="30">
@@ -1695,7 +1791,7 @@
 					twice the unidentified_request_period are pruned.</synopsis>
 				</configOption>
 				<configOption name="type">
-					<synopsis>Must be of type 'global'.</synopsis>
+					<synopsis>Must be of type 'global' UNLESS the object name is 'global'.</synopsis>
 				</configOption>
 				<configOption name="user_agent" default="Asterisk &lt;Asterisk Version&gt;">
 					<synopsis>Value used in User-Agent header for SIP requests and Server header for SIP responses.</synopsis>
@@ -1711,7 +1807,7 @@
 					<synopsis>The voicemail extension to send in the NOTIFY Message-Account header if not specified on endpoint or aor</synopsis>
 				</configOption>
 				<configOption name="debug" default="no">
-					<synopsis>Enable/Disable SIP debug logging.  Valid options include yes|no or
+					<synopsis>Enable/Disable SIP debug logging.  Valid options include yes, no, or
 						a host address</synopsis>
 				</configOption>
 				<configOption name="endpoint_identifier_order">
@@ -1810,6 +1906,36 @@
 						<note><para>The caller-id and redirecting number strings
 						obtained from incoming SIP URI user fields are always truncated
 						at the first semicolon.</para></note>
+					</description>
+				</configOption>
+				<configOption name="use_callerid_contact" default="no">
+					<synopsis>Place caller-id information into Contact header</synopsis>
+					<description><para>
+						This option will cause Asterisk to place caller-id information into
+						generated Contact headers.</para>
+					</description>
+				</configOption>
+				<configOption name="send_contact_status_on_update_registration" default="no">
+					<synopsis>Enable sending AMI ContactStatus event when a device refreshes its registration.</synopsis>
+				</configOption>
+				<configOption name="taskprocessor_overload_trigger">
+					<synopsis>Trigger scope for taskprocessor overloads</synopsis>
+					<description><para>
+						This option specifies the trigger the distributor will use for
+						detecting taskprocessor overloads.  When it detects an overload condition,
+						the distrubutor will stop accepting new requests until the overload is
+						cleared.
+						</para>
+						<enumlist>
+							<enum name="global"><para>(default) Any taskprocessor overload will trigger.</para></enum>
+							<enum name="pjsip_only"><para>Only pjsip taskprocessor overloads will trigger.</para></enum>
+							<enum name="none"><para>No overload detection will be performed.</para></enum>
+						</enumlist>
+						<warning><para>
+						The "none" and "pjsip_only" options should be used
+						with extreme caution and only to mitigate specific issues.
+						Under certain conditions they could make things worse.
+						</para></warning>
 					</description>
 				</configOption>
 			</configObject>
@@ -2103,6 +2229,12 @@
 				</parameter>
 				<parameter name="DirectMediaMethod">
 					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='direct_media_method']/synopsis/node())"/></para>
+				</parameter>
+				<parameter name="TrustConnectedLine">
+					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='trust_connected_line']/synopsis/node())"/></para>
+				</parameter>
+				<parameter name="SendConnectedLine">
+					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='send_connected_line']/synopsis/node())"/></para>
 				</parameter>
 				<parameter name="ConnectedLineMethod">
 					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='endpoint']/configOption[@name='connected_line_method']/synopsis/node())"/></para>
@@ -2704,9 +2836,6 @@
 /*! Number of serializers in pool if one not supplied. */
 #define SERIALIZER_POOL_SIZE		8
 
-/*! Next serializer pool index to use. */
-static int serializer_pool_pos;
-
 /*! Pool of serializers to use if not supplied. */
 static struct ast_taskprocessor *serializer_pool[SERIALIZER_POOL_SIZE];
 
@@ -3208,7 +3337,12 @@ int ast_sip_dlg_set_transport(const struct ast_sip_endpoint *endpoint, pjsip_dia
 	}
 
 	ast_sip_set_tpselector_from_ep_or_uri(endpoint, uri, selector);
+
 	pjsip_dlg_set_transport(dlg, selector);
+
+	if (selector == &sel) {
+		ast_sip_tpselector_unref(&sel);
+	}
 
 	return 0;
 }
@@ -3298,7 +3432,8 @@ static int sip_dialog_create_from(pj_pool_t *pool, pj_str_t *from, const char *u
 
 int ast_sip_set_tpselector_from_transport(const struct ast_sip_transport *transport, pjsip_tpselector *selector)
 {
-	RAII_VAR(struct ast_sip_transport_state *, transport_state, NULL, ao2_cleanup);
+	int res = 0;
+	struct ast_sip_transport_state *transport_state;
 
 	transport_state = ast_sip_get_transport_state(ast_sorcery_object_get_id(transport));
 	if (!transport_state) {
@@ -3307,9 +3442,15 @@ int ast_sip_set_tpselector_from_transport(const struct ast_sip_transport *transp
 		return -1;
 	}
 
+	/* Only flows maintain dynamic state which needs protection */
+	if (transport_state->flow) {
+		ao2_lock(transport_state);
+	}
+
 	if (transport_state->transport) {
 		selector->type = PJSIP_TPSELECTOR_TRANSPORT;
 		selector->u.transport = transport_state->transport;
+		pjsip_transport_add_ref(selector->u.transport);
 	} else if (transport_state->factory) {
 		selector->type = PJSIP_TPSELECTOR_LISTENER;
 		selector->u.listener = transport_state->factory;
@@ -3318,12 +3459,25 @@ int ast_sip_set_tpselector_from_transport(const struct ast_sip_transport *transp
 		 * even if an endpoint is locked to a WebSocket transport we let the PJSIP logic
 		 * find the existing connection if available and use it.
 		 */
-		return 0;
+	} else if (transport->flow) {
+		/* This is a child of another transport, so we need to establish a new connection */
+#ifdef HAVE_PJSIP_TRANSPORT_DISABLE_CONNECTION_REUSE
+		selector->disable_connection_reuse = PJ_TRUE;
+#else
+		ast_log(LOG_WARNING, "Connection reuse could not be disabled on transport '%s' as support is not available\n",
+			ast_sorcery_object_get_id(transport));
+#endif
 	} else {
-		return -1;
+		res = -1;
 	}
 
-	return 0;
+	if (transport_state->flow) {
+		ao2_unlock(transport_state);
+	}
+
+	ao2_ref(transport_state, -1);
+
+	return res;
 }
 
 int ast_sip_set_tpselector_from_transport_name(const char *transport_name, pjsip_tpselector *selector)
@@ -3354,6 +3508,13 @@ int ast_sip_set_tpselector_from_ep_or_uri(const struct ast_sip_endpoint *endpoin
 	}
 
 	return ast_sip_set_tpselector_from_transport_name(transport_name, selector);
+}
+
+void ast_sip_tpselector_unref(pjsip_tpselector *selector)
+{
+	if (selector->type == PJSIP_TPSELECTOR_TRANSPORT && selector->u.transport) {
+		pjsip_transport_dec_ref(selector->u.transport);
+	}
 }
 
 void ast_sip_add_usereqphone(const struct ast_sip_endpoint *endpoint, pj_pool_t *pool, pjsip_uri *uri)
@@ -3424,8 +3585,11 @@ pjsip_dialog *ast_sip_create_dialog_uac(const struct ast_sip_endpoint *endpoint,
 	if (sip_dialog_create_from(dlg->pool, &local_uri, endpoint->fromuser, endpoint->fromdomain, &remote_uri, &selector)) {
 		dlg->sess_count--;
 		pjsip_dlg_terminate(dlg);
+		ast_sip_tpselector_unref(&selector);
 		return NULL;
 	}
+
+	ast_sip_tpselector_unref(&selector);
 
 	/* Update the dialog with the new local URI, we do it afterwards so we can use the dialog pool for construction */
 	pj_strdup_with_null(dlg->pool, &dlg->local.info_str, &local_uri);
@@ -3573,12 +3737,16 @@ pjsip_dialog *ast_sip_create_dialog_uas(const struct ast_sip_endpoint *endpoint,
 		pj_strerror(*status, err, sizeof(err));
 		ast_log(LOG_ERROR, "Could not create dialog with endpoint %s. %s\n",
 				ast_sorcery_object_get_id(endpoint), err);
+		ast_sip_tpselector_unref(&selector);
 		return NULL;
 	}
 
 	dlg->sess_count++;
 	pjsip_dlg_set_transport(dlg, &selector);
 	dlg->sess_count--;
+
+	ast_sip_tpselector_unref(&selector);
+
 #ifdef HAVE_PJSIP_DLG_CREATE_UAS_AND_INC_LOCK
 	pjsip_dlg_dec_lock(dlg);
 #endif
@@ -3605,6 +3773,8 @@ int ast_sip_create_rdata_with_contact(pjsip_rx_data *rdata, char *packet, const 
 	ast_copy_string(rdata->pkt_info.packet, packet, sizeof(rdata->pkt_info.packet));
 	ast_copy_string(rdata->pkt_info.src_name, src_name, sizeof(rdata->pkt_info.src_name));
 	rdata->pkt_info.src_port = src_port;
+	pj_sockaddr_parse(pj_AF_UNSPEC(), 0, pj_cstr(&tmp, src_name), &rdata->pkt_info.src_addr);
+	pj_sockaddr_set_port(&rdata->pkt_info.src_addr, src_port);
 
 	pjsip_parse_rdata(packet, strlen(packet), rdata);
 	if (!rdata->msg_info.msg || !pj_list_empty(&rdata->msg_info.parse_err)) {
@@ -3710,7 +3880,7 @@ static int create_out_of_dialog_request(const pjsip_method *method, struct ast_s
 			contact = ast_sip_location_retrieve_contact_from_aor_list(endpoint->aors);
 		}
 		if (!contact || ast_strlen_zero(contact->uri)) {
-			ast_log(LOG_ERROR, "Unable to retrieve contact for endpoint %s\n",
+			ast_log(LOG_WARNING, "Unable to retrieve contact for endpoint %s\n",
 					ast_sorcery_object_get_id(endpoint));
 			return -1;
 		}
@@ -3746,6 +3916,7 @@ static int create_out_of_dialog_request(const pjsip_method *method, struct ast_s
 				(int) pj_strlen(&method->name), pj_strbuf(&method->name),
 				endpoint ? ast_sorcery_object_get_id(endpoint) : "<none>");
 		pjsip_endpt_release_pool(ast_sip_get_pjsip_endpoint(), pool);
+		ast_sip_tpselector_unref(&selector);
 		return -1;
 	}
 
@@ -3755,10 +3926,13 @@ static int create_out_of_dialog_request(const pjsip_method *method, struct ast_s
 				(int) pj_strlen(&method->name), pj_strbuf(&method->name),
 				endpoint ? ast_sorcery_object_get_id(endpoint) : "<none>");
 		pjsip_endpt_release_pool(ast_sip_get_pjsip_endpoint(), pool);
+		ast_sip_tpselector_unref(&selector);
 		return -1;
 	}
 
 	pjsip_tx_data_set_transport(*tdata, &selector);
+
+	ast_sip_tpselector_unref(&selector);
 
 	if (endpoint && !ast_strlen_zero(endpoint->contact_user)){
 		pjsip_contact_hdr *contact_hdr;
@@ -4314,6 +4488,10 @@ int ast_sip_send_out_of_dialog_request(pjsip_tx_data *tdata,
 		return -1;
 	}
 
+	if (endpoint) {
+		ast_sip_message_apply_transport(endpoint->transport, tdata);
+	}
+
 	contact = ast_sip_mod_data_get(tdata->mod_data, supplement_module.id, MOD_DATA_CONTACT);
 
 	AST_RWLIST_RDLOCK(&supplements);
@@ -4486,22 +4664,20 @@ static int serializer_pool_setup(void)
 
 static struct ast_taskprocessor *serializer_pool_pick(void)
 {
-	struct ast_taskprocessor *serializer;
+	int idx;
+	int pos = 0;
 
-	unsigned int pos;
+	if (!serializer_pool[0]) {
+		return NULL;
+	}
 
-	/*
-	 * Pick a serializer to use from the pool.
-	 *
-	 * Note: We don't care about any reentrancy behavior
-	 * when incrementing serializer_pool_pos.  If it gets
-	 * incorrectly incremented it doesn't matter.
-	 */
-	pos = serializer_pool_pos++;
-	pos %= SERIALIZER_POOL_SIZE;
-	serializer = serializer_pool[pos];
+	for (idx = 1; idx < SERIALIZER_POOL_SIZE; ++idx) {
+		if (ast_taskprocessor_size(serializer_pool[idx]) < ast_taskprocessor_size(serializer_pool[pos])) {
+			pos = idx;
+		}
+	}
 
-	return serializer;
+	return serializer_pool[pos];
 }
 
 int ast_sip_push_task(struct ast_taskprocessor *serializer, int (*sip_task)(void *), void *task_data)
@@ -4756,6 +4932,10 @@ static void supplement_outgoing_response(pjsip_tx_data *tdata, struct ast_sip_en
 	struct ast_sip_supplement *supplement;
 	pjsip_cseq_hdr *cseq = pjsip_msg_find_hdr(tdata->msg, PJSIP_H_CSEQ, NULL);
 	struct ast_sip_contact *contact = ast_sip_mod_data_get(tdata->mod_data, supplement_module.id, MOD_DATA_CONTACT);
+
+	if (sip_endpoint) {
+		ast_sip_message_apply_transport(sip_endpoint->transport, tdata);
+	}
 
 	AST_RWLIST_RDLOCK(&supplements);
 	AST_LIST_TRAVERSE(&supplements, supplement, next) {
@@ -5148,7 +5328,7 @@ static int load_module(void)
 	/* The serializer needs threadpool and threadpool needs pjproject to be initialized so it's next */
 	sip_get_threadpool_options(&options);
 	options.thread_start = sip_thread_start;
-	sip_threadpool = ast_threadpool_create("SIP", NULL, &options);
+	sip_threadpool = ast_threadpool_create("pjsip", NULL, &options);
 	if (!sip_threadpool) {
 		goto error;
 	}

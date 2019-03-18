@@ -1287,7 +1287,7 @@ void ast_rtp_codecs_payloads_set_m_type(struct ast_rtp_codecs *codecs, struct as
 {
 	struct ast_rtp_payload_type *new_type;
 
-	if (payload < 0 || payload >= AST_RTP_MAX_PT) {
+	if (payload < 0 || payload >= AST_RTP_MAX_PT || payload > AST_RTP_PT_LAST_STATIC) {
 		return;
 	}
 
@@ -3379,8 +3379,8 @@ static struct ast_json *rtcp_report_to_json(struct stasis_message *msg,
 		char str_lsr[32];
 
 		snprintf(str_lsr, sizeof(str_lsr), "%u", payload->report->report_block[i]->lsr);
-		json_report_block = ast_json_pack("{s: i, s: i, s: i, s: i, s: i, s: s, s: i}",
-			"source_ssrc", payload->report->report_block[i]->source_ssrc,
+		json_report_block = ast_json_pack("{s: I, s: i, s: i, s: i, s: i, s: s, s: i}",
+			"source_ssrc", (ast_json_int_t)payload->report->report_block[i]->source_ssrc,
 			"fraction_lost", payload->report->report_block[i]->lost_count.fraction,
 			"packets_lost", payload->report->report_block[i]->lost_count.packets,
 			"highest_seq_no", payload->report->report_block[i]->highest_seq_no,
@@ -3412,8 +3412,8 @@ static struct ast_json *rtcp_report_to_json(struct stasis_message *msg,
 		}
 	}
 
-	json_rtcp_report = ast_json_pack("{s: i, s: i, s: i, s: o, s: o}",
-		"ssrc", payload->report->ssrc,
+	json_rtcp_report = ast_json_pack("{s: I, s: i, s: i, s: o, s: o}",
+		"ssrc", (ast_json_int_t)payload->report->ssrc,
 		"type", payload->report->type,
 		"report_count", payload->report->reception_report_count,
 		"sender_information", json_rtcp_sender_info ?: ast_json_null(),
@@ -3430,10 +3430,10 @@ static struct ast_json *rtcp_report_to_json(struct stasis_message *msg,
 		}
 	}
 
-	return ast_json_pack("{s: o, s: o, s: o}",
-		"channel", payload->snapshot ? json_channel : ast_json_null(),
+	return ast_json_pack("{s: o?, s: o, s: O?}",
+		"channel", json_channel,
 		"rtcp_report", json_rtcp_report,
-		"blob", ast_json_deep_copy(payload->blob) ?: ast_json_null());
+		"blob", payload->blob);
 }
 
 static void rtp_rtcp_report_dtor(void *obj)
@@ -3539,7 +3539,7 @@ int ast_rtp_engine_init(void)
 	ast_rwlock_init(&mime_types_lock);
 	ast_rwlock_init(&static_RTP_PT_lock);
 
-	rtp_topic = stasis_topic_create("rtp_topic");
+	rtp_topic = stasis_topic_create("rtp:all");
 	if (!rtp_topic) {
 		return -1;
 	}

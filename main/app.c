@@ -873,25 +873,37 @@ int ast_vm_test_destroy_user(const char *context, const char *mailbox)
 }
 #endif
 
-int ast_dtmf_stream(struct ast_channel *chan, struct ast_channel *peer, const char *digits, int between, unsigned int duration)
+static int external_sleep(struct ast_channel *chan, int ms)
+{
+	usleep(ms * 1000);
+	return 0;
+}
+
+static int dtmf_stream(struct ast_channel *chan, const char *digits, int between, unsigned int duration, int is_external)
 {
 	const char *ptr;
 	int res;
 	struct ast_silence_generator *silgen = NULL;
+	int (*my_sleep)(struct ast_channel *chan, int ms);
+	int (*my_senddigit)(struct ast_channel *chan, char digit, unsigned int duration);
+
+	if (is_external) {
+		my_sleep = external_sleep;
+		my_senddigit = ast_senddigit_external;
+	} else {
+		my_sleep = ast_safe_sleep;
+		my_senddigit = ast_senddigit;
+	}
 
 	if (!between) {
 		between = 100;
-	}
-
-	if (peer && ast_autoservice_start(peer)) {
-		return -1;
 	}
 
 	/* Need a quiet time before sending digits. */
 	if (ast_opt_transmit_silence) {
 		silgen = ast_channel_start_silence_generator(chan);
 	}
-	res = ast_safe_sleep(chan, 100);
+	res = my_sleep(chan, 100);
 	if (res) {
 		goto dtmf_stream_cleanup;
 	}
@@ -899,12 +911,14 @@ int ast_dtmf_stream(struct ast_channel *chan, struct ast_channel *peer, const ch
 	for (ptr = digits; *ptr; ptr++) {
 		if (*ptr == 'w') {
 			/* 'w' -- wait half a second */
-			if ((res = ast_safe_sleep(chan, 500))) {
+			res = my_sleep(chan, 500);
+			if (res) {
 				break;
 			}
 		} else if (*ptr == 'W') {
 			/* 'W' -- wait a second */
-			if ((res = ast_safe_sleep(chan, 1000))) {
+			res = my_sleep(chan, 1000);
+			if (res) {
 				break;
 			}
 		} else if (strchr("0123456789*#abcdfABCDF", *ptr)) {
@@ -913,10 +927,11 @@ int ast_dtmf_stream(struct ast_channel *chan, struct ast_channel *peer, const ch
 				ast_indicate(chan, AST_CONTROL_FLASH);
 			} else {
 				/* Character represents valid DTMF */
-				ast_senddigit(chan, *ptr, duration);
+				my_senddigit(chan, *ptr, duration);
 			}
 			/* pause between digits */
-			if ((res = ast_safe_sleep(chan, between))) {
+			res = my_sleep(chan, between);
+			if (res) {
 				break;
 			}
 		} else {
@@ -928,11 +943,28 @@ dtmf_stream_cleanup:
 	if (silgen) {
 		ast_channel_stop_silence_generator(chan, silgen);
 	}
+
+	return res;
+}
+
+int ast_dtmf_stream(struct ast_channel *chan, struct ast_channel *peer, const char *digits, int between, unsigned int duration)
+{
+	int res;
+
+	if (peer && ast_autoservice_start(peer)) {
+		return -1;
+	}
+	res = dtmf_stream(chan, digits, between, duration, 0);
 	if (peer && ast_autoservice_stop(peer)) {
 		res = -1;
 	}
 
 	return res;
+}
+
+void ast_dtmf_stream_external(struct ast_channel *chan, const char *digits, int between, unsigned int duration)
+{
+	dtmf_stream(chan, digits, between, duration, 1);
 }
 
 struct linear_state {
@@ -3212,15 +3244,7 @@ static struct stasis_message *mwi_state_create_message(
 	mwi_state->old_msgs = old_msgs;
 
 	if (!ast_strlen_zero(channel_id)) {
-		struct stasis_message *chan_message;
-
-		chan_message = stasis_cache_get(ast_channel_cache(), ast_channel_snapshot_type(),
-			channel_id);
-		if (chan_message) {
-			mwi_state->snapshot = stasis_message_data(chan_message);
-			ao2_ref(mwi_state->snapshot, +1);
-		}
-		ao2_cleanup(chan_message);
+		mwi_state->snapshot = ast_channel_snapshot_get_latest(channel_id);
 	}
 
 	if (eid) {
@@ -3312,6 +3336,7 @@ int ast_delete_mwi_state_full(const char *mailbox, const char *context, struct a
 	if (clear_msg) {
 		stasis_publish(mailbox_specific_topic, clear_msg);
 	}
+
 	ao2_cleanup(clear_msg);
 	return 0;
 }
@@ -3403,7 +3428,7 @@ int app_init(void)
 	if (STASIS_MESSAGE_TYPE_INIT(ast_mwi_vm_app_type) != 0) {
 		return -1;
 	}
-	mwi_topic_all = stasis_topic_create("stasis_mwi_topic");
+	mwi_topic_all = stasis_topic_create("mwi:all");
 	if (!mwi_topic_all) {
 		return -1;
 	}
@@ -3419,7 +3444,7 @@ int app_init(void)
 	if (!mwi_topic_pool) {
 		return -1;
 	}
-	queue_topic_all = stasis_topic_create("stasis_queue_topic");
+	queue_topic_all = stasis_topic_create("queue:all");
 	if (!queue_topic_all) {
 		return -1;
 	}

@@ -71,6 +71,8 @@
 #include "asterisk/json.h"
 #include "asterisk/format_cache.h"
 #include "asterisk/taskprocessor.h"
+#include "asterisk/stream.h"
+#include "asterisk/message.h"
 
 /*** DOCUMENTATION
 	<application name="ConfBridge" language="en_US">
@@ -547,6 +549,7 @@ const char *conf_get_sound(enum conf_sounds sound, struct bridge_profile_sounds 
 	return "";
 }
 
+
 static void send_conf_stasis(struct confbridge_conference *conference, struct ast_channel *chan,
 	struct stasis_message_type *type, struct ast_json *extras, int channel_topic)
 {
@@ -571,6 +574,10 @@ static void send_conf_stasis(struct confbridge_conference *conference, struct as
 	ast_bridge_unlock(conference->bridge);
 	if (!msg) {
 		return;
+	}
+
+	if (ast_test_flag(&conference->b_profile, BRIDGE_OPT_ENABLE_EVENTS)) {
+		conf_send_event_to_participants(conference, chan, msg);
 	}
 
 	if (channel_topic) {
@@ -706,6 +713,11 @@ static int is_new_rec_file(const char *rec_file, struct ast_str **orig_rec_file)
 		}
 	}
 	return 0;
+}
+
+struct confbridge_conference *conf_find_bridge(const char *conference_name)
+{
+	return ao2_find(conference_bridges, conference_name, OBJ_KEY);
 }
 
 /*!
@@ -1099,13 +1111,15 @@ static void destroy_conference_bridge(void *obj)
 		if (conference->playback_queue) {
 			struct hangup_data hangup;
 			hangup_data_init(&hangup, conference);
-			ast_taskprocessor_push(conference->playback_queue, hangup_playback, &hangup);
 
-			ast_mutex_lock(&hangup.lock);
-			while (!hangup.hungup) {
-				ast_cond_wait(&hangup.cond, &hangup.lock);
+			if (!ast_taskprocessor_push(conference->playback_queue, hangup_playback, &hangup)) {
+				ast_mutex_lock(&hangup.lock);
+				while (!hangup.hungup) {
+					ast_cond_wait(&hangup.cond, &hangup.lock);
+				}
+				ast_mutex_unlock(&hangup.lock);
 			}
-			ast_mutex_unlock(&hangup.lock);
+
 			hangup_data_destroy(&hangup);
 		} else {
 			/* Playback queue is not yet allocated. Just hang up the channel straight */
@@ -1346,7 +1360,7 @@ int conf_handle_inactive_waitmarked(struct confbridge_user *user)
 	return 0;
 }
 
-int conf_handle_only_unmarked(struct confbridge_user *user)
+int conf_handle_only_person(struct confbridge_user *user)
 {
 	/* If audio prompts have not been quieted or this prompt quieted play it on out */
 	if (!ast_test_flag(&user->u_profile, USER_OPT_QUIET | USER_OPT_NOONLYPERSON)) {
@@ -1449,25 +1463,19 @@ static int alloc_playback_chan(struct confbridge_conference *conference)
 /*!
  * \brief Push the announcer channel into the bridge
  *
- * This runs in the playback queue taskprocessor.
- *
- * \param data A confbridge_conference
+ * \param conference Conference bridge to push the announcer to
  * \retval 0 Success
  * \retval -1 Failed to push the channel to the bridge
  */
-static int push_announcer(void *data)
+static int push_announcer(struct confbridge_conference *conference)
 {
-	struct confbridge_conference *conference = data;
-
 	if (conf_announce_channel_push(conference->playback_chan)) {
 		ast_hangup(conference->playback_chan);
 		conference->playback_chan = NULL;
-		ao2_cleanup(conference);
 		return -1;
 	}
 
 	ast_autoservice_start(conference->playback_chan);
-	ao2_cleanup(conference);
 	return 0;
 }
 
@@ -1560,6 +1568,10 @@ static struct confbridge_conference *join_conference_bridge(const char *conferen
 			}
 		}
 
+		if (ast_test_flag(&conference->b_profile, BRIDGE_OPT_ENABLE_EVENTS)) {
+			ast_bridge_set_send_sdp_label(conference->bridge, 1);
+		}
+
 		/* Link it into the conference bridges container */
 		if (!ao2_link(conference_bridges, conference)) {
 			ao2_ref(conference, -1);
@@ -1580,7 +1592,7 @@ static struct confbridge_conference *join_conference_bridge(const char *conferen
 			return NULL;
 		}
 
-		if (ast_taskprocessor_push(conference->playback_queue, push_announcer, ao2_bump(conference))) {
+		if (push_announcer(conference)) {
 			ao2_unlink(conference_bridges, conference);
 			ao2_ref(conference, -1);
 			ao2_unlock(conference_bridges);
@@ -2309,6 +2321,25 @@ static int join_callback(struct ast_bridge_channel *bridge_channel, void *ignore
 	return 0;
 }
 
+struct confbridge_hook_data {
+	struct confbridge_conference *conference;
+	struct confbridge_user *user;
+	enum ast_bridge_hook_type hook_type;
+};
+
+static int send_event_hook_callback(struct ast_bridge_channel *bridge_channel, void *data)
+{
+	struct confbridge_hook_data *hook_data = data;
+
+	if (hook_data->hook_type == AST_BRIDGE_HOOK_TYPE_JOIN) {
+		send_join_event(hook_data->user, hook_data->conference);
+	} else {
+		send_leave_event(hook_data->user, hook_data->conference);
+	}
+
+	return 0;
+}
+
 /*! \brief The ConfBridge application */
 static int confbridge_exec(struct ast_channel *chan, const char *data)
 {
@@ -2326,6 +2357,9 @@ static int confbridge_exec(struct ast_channel *chan, const char *data)
 		.tech_args.silence_threshold = DEFAULT_SILENCE_THRESHOLD,
 		.tech_args.drop_silence = 0,
 	};
+	struct confbridge_hook_data *join_hook_data;
+	struct confbridge_hook_data *leave_hook_data;
+
 	AST_DECLARE_APP_ARGS(args,
 		AST_APP_ARG(conf_name);
 		AST_APP_ARG(b_profile_name);
@@ -2508,8 +2542,39 @@ static int confbridge_exec(struct ast_channel *chan, const char *data)
 
 	conf_moh_unsuspend(&user);
 
-	/* Join our conference bridge for real */
-	send_join_event(&user, conference);
+	join_hook_data = ast_malloc(sizeof(*join_hook_data));
+	if (!join_hook_data) {
+		res = -1;
+		goto confbridge_cleanup;
+	}
+	join_hook_data->user = &user;
+	join_hook_data->conference = conference;
+	join_hook_data->hook_type = AST_BRIDGE_HOOK_TYPE_JOIN;
+	res = ast_bridge_join_hook(&user.features, send_event_hook_callback,
+		join_hook_data, ast_free_ptr, 0);
+	if (res) {
+		ast_free(join_hook_data);
+		ast_log(LOG_ERROR, "Couldn't add bridge join hook for channel '%s'\n", ast_channel_name(chan));
+		goto confbridge_cleanup;
+	}
+
+	leave_hook_data = ast_malloc(sizeof(*leave_hook_data));
+	if (!leave_hook_data) {
+		/* join_hook_data is cleaned up by ast_bridge_features_cleanup via the goto */
+		res = -1;
+		goto confbridge_cleanup;
+	}
+	leave_hook_data->user = &user;
+	leave_hook_data->conference = conference;
+	leave_hook_data->hook_type = AST_BRIDGE_HOOK_TYPE_LEAVE;
+	res = ast_bridge_leave_hook(&user.features, send_event_hook_callback,
+		leave_hook_data, ast_free_ptr, 0);
+	if (res) {
+		/* join_hook_data is cleaned up by ast_bridge_features_cleanup via the goto */
+		ast_free(leave_hook_data);
+		ast_log(LOG_ERROR, "Couldn't add bridge leave hook for channel '%s'\n", ast_channel_name(chan));
+		goto confbridge_cleanup;
+	}
 
 	if (ast_bridge_join_hook(&user.features, join_callback, NULL, NULL, 0)) {
 		async_play_sound_ready(user.chan);
@@ -2530,8 +2595,6 @@ static int confbridge_exec(struct ast_channel *chan, const char *data)
 	if (!user.kicked && ast_check_hangup(chan)) {
 		pbx_builtin_setvar_helper(chan, "CONFBRIDGE_RESULT", "HANGUP");
 	}
-
-	send_leave_event(&user, conference);
 
 	/* if we're shutting down, don't attempt to do further processing */
 	if (ast_shutting_down()) {
@@ -4133,8 +4196,9 @@ static int load_module(void)
 	}
 
 	/* Create a container to hold the conference bridges */
-	conference_bridges = ao2_container_alloc(CONFERENCE_BRIDGE_BUCKETS,
-		conference_bridge_hash_cb, conference_bridge_cmp_cb);
+	conference_bridges = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		CONFERENCE_BRIDGE_BUCKETS,
+		conference_bridge_hash_cb, NULL, conference_bridge_cmp_cb);
 	if (!conference_bridges) {
 		unload_module();
 		return AST_MODULE_LOAD_DECLINE;

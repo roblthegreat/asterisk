@@ -176,7 +176,7 @@
 /*** MODULEINFO
 	<use type="module">res_crypto</use>
 	<use type="module">res_http_websocket</use>
-	<support_level>extended</support_level>
+	<support_level>deprecated</support_level>
  ***/
 
 /*!  \page sip_session_timers SIP Session Timers in Asterisk Chan_sip
@@ -1815,8 +1815,9 @@ static int initialize_escs(void)
 {
 	int i, res = 0;
 	for (i = 0; i < ARRAY_LEN(event_state_compositors); i++) {
-		if (!((event_state_compositors[i].compositor) =
-					ao2_container_alloc(ESC_MAX_BUCKETS, esc_hash_fn, esc_cmp_fn))) {
+		event_state_compositors[i].compositor = ao2_container_alloc_hash(
+			AO2_ALLOC_OPT_LOCK_MUTEX, 0, ESC_MAX_BUCKETS, esc_hash_fn, NULL, esc_cmp_fn);
+		if (!event_state_compositors[i].compositor) {
 			res = -1;
 		}
 	}
@@ -2617,7 +2618,8 @@ static int sip_tcptls_write(struct ast_tcptls_session_instance *tcptls_session, 
 
 	ao2_lock(tcptls_session);
 
-	if (!(th = ao2_t_find(threadt, &tmp, OBJ_POINTER, "ao2_find, getting sip_threadinfo in tcp helper thread")) ||
+	if (!tcptls_session->stream ||
+		!(th = ao2_t_find(threadt, &tmp, OBJ_POINTER, "ao2_find, getting sip_threadinfo in tcp helper thread")) ||
 		!(packet = ao2_alloc(sizeof(*packet), tcptls_packet_destructor)) ||
 		!(packet->data = ast_str_create(len))) {
 		goto tcptls_write_setup_error;
@@ -3139,7 +3141,7 @@ static void *_sip_tcp_helper_thread(struct ast_tcptls_session_instance *tcptls_s
 
 			if (read(me->alert_pipe[0], &alert, sizeof(alert)) == -1) {
 				ast_log(LOG_ERROR, "read() failed: %s\n", strerror(errno));
-				continue;
+				goto cleanup;
 			}
 
 			switch (alert) {
@@ -3157,10 +3159,13 @@ static void *_sip_tcp_helper_thread(struct ast_tcptls_session_instance *tcptls_s
 						ast_log(LOG_WARNING, "Failure to write to tcp/tls socket\n");
 					}
 					ao2_t_ref(packet, -1, "tcptls packet sent, this is no longer needed");
+				} else {
+					goto cleanup;
 				}
 				break;
 			default:
 				ast_log(LOG_ERROR, "Unknown tcptls thread alert '%u'\n", alert);
+				goto cleanup;
 			}
 		}
 	}
@@ -5312,6 +5317,7 @@ static void sip_destroy_peer(struct sip_peer *peer)
 
 	register_peer_exten(peer, FALSE);
 	ast_free_acl_list(peer->acl);
+	ast_free_acl_list(peer->contactacl);
 	ast_free_acl_list(peer->directmediaacl);
 	if (peer->selfdestruct)
 		ast_atomic_fetchadd_int(&apeerobjs, -1);
@@ -11631,15 +11637,16 @@ static int process_sdp_a_text(const char *a, struct sip_pvt *p, struct ast_rtp_c
 				ast_verbose("Discarded description format %s for ID %u\n", mimeSubtype, codec);
 		}
 	} else if (!strncmp(a, red_fmtp, strlen(red_fmtp))) {
+		char *rest;
 		/* count numbers of generations in fmtp */
 		red_cp = &red_fmtp[strlen(red_fmtp)];
 		strncpy(red_fmtp, a, 100);
 
 		sscanf(red_cp, "%30u", (unsigned *)&red_data_pt[*red_num_gen]);
-		red_cp = strtok(red_cp, "/");
+		red_cp = strtok_r(red_cp, "/", &rest);
 		while (red_cp && (*red_num_gen)++ < AST_RED_MAX_GENERATION) {
 			sscanf(red_cp, "%30u", (unsigned *)&red_data_pt[*red_num_gen]);
-			red_cp = strtok(NULL, "/");
+			red_cp = strtok_r(NULL, "/", &rest);
 		}
 		red_cp = red_fmtp;
 		found = TRUE;
@@ -15635,7 +15642,7 @@ static int manager_sipnotify(struct mansession *s, const struct message *m)
 			return 0;
 		}
 
-		if (create_addr(p, channame, NULL, 0)) {
+		if (create_addr(p, channame, NULL, 1)) {
 			/* Maybe they're not registered, etc. */
 			dialog_unlink_all(p);
 			dialog_unref(p, "unref dialog inside for loop" );
@@ -17490,6 +17497,8 @@ static void network_change_stasis_subscribe(void)
 	if (!network_change_sub) {
 		network_change_sub = stasis_subscribe(ast_system_topic(),
 			network_change_stasis_cb, NULL);
+		stasis_subscription_accept_message_type(network_change_sub, ast_network_change_type());
+		stasis_subscription_set_filter(network_change_sub, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 	}
 }
 
@@ -17503,6 +17512,8 @@ static void acl_change_stasis_subscribe(void)
 	if (!acl_change_sub) {
 		acl_change_sub = stasis_subscribe(ast_security_topic(),
 			acl_change_stasis_cb, NULL);
+		stasis_subscription_accept_message_type(acl_change_sub, ast_named_acl_change_type());
+		stasis_subscription_set_filter(acl_change_sub, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 	}
 
 }
@@ -21169,6 +21180,7 @@ static char *_sip_show_peer(int type, int fd, struct mansession *s, const struct
 		ast_cli(fd, "  Force rport  : %s\n", force_rport_string(peer->flags));
 		ast_cli(fd, "  Symmetric RTP: %s\n", comedia_string(peer->flags));
 		ast_cli(fd, "  ACL          : %s\n", AST_CLI_YESNO(ast_acl_list_is_empty(peer->acl) == 0));
+		ast_cli(fd, "  ContactACL   : %s\n", AST_CLI_YESNO(ast_acl_list_is_empty(peer->contactacl) == 0));
 		ast_cli(fd, "  DirectMedACL : %s\n", AST_CLI_YESNO(ast_acl_list_is_empty(peer->directmediaacl) == 0));
 		ast_cli(fd, "  T.38 support : %s\n", AST_CLI_YESNO(ast_test_flag(&peer->flags[1], SIP_PAGE2_T38SUPPORT)));
 		ast_cli(fd, "  T.38 EC mode : %s\n", faxec2str(ast_test_flag(&peer->flags[1], SIP_PAGE2_T38SUPPORT)));
@@ -25899,7 +25911,13 @@ static int handle_invite_replaces(struct sip_pvt *p, struct sip_request *req,
 		}
 		ao2_ref(bridge, -1);
 	} else {
-		ast_channel_move(replaces_chan, c);
+		int pickedup;
+		ast_channel_lock(replaces_chan);
+		pickedup = ast_can_pickup(replaces_chan) && !ast_do_pickup(c, replaces_chan);
+		ast_channel_unlock(replaces_chan);
+		if (!pickedup) {
+			ast_channel_move(replaces_chan, c);
+		}
 		ast_hangup(c);
 	}
 	ast_channel_unref(c);
@@ -28375,6 +28393,9 @@ static void add_peer_mwi_subs(struct sip_peer *peer)
 		mailbox_specific_topic = ast_mwi_topic(mailbox->id);
 		if (mailbox_specific_topic) {
 			mailbox->event_sub = stasis_subscribe_pool(mailbox_specific_topic, mwi_event_cb, peer);
+			stasis_subscription_accept_message_type(mailbox->event_sub, ast_mwi_state_type());
+			stasis_subscription_accept_message_type(mailbox->event_sub, stasis_subscription_change_type());
+			stasis_subscription_set_filter(mailbox->event_sub, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 		}
 	}
 }
@@ -31506,6 +31527,7 @@ static struct sip_peer *build_peer(const char *name, struct ast_variable *v_head
 	struct ast_variable *v = v_head;
 	struct sip_peer *peer = NULL;
 	struct ast_acl_list *oldacl = NULL;
+	struct ast_acl_list *oldcontactacl = NULL;
 	struct ast_acl_list *olddirectmediaacl = NULL;
 	int found = 0;
 	int firstpass = 1;
@@ -31583,6 +31605,8 @@ static struct sip_peer *build_peer(const char *name, struct ast_variable *v_head
 	if (firstpass) {
 		oldacl = peer->acl;
 		peer->acl = NULL;
+		oldcontactacl = peer->contactacl;
+		peer->contactacl = NULL;
 		olddirectmediaacl = peer->directmediaacl;
 		peer->directmediaacl = NULL;
 		set_peer_defaults(peer);	/* Set peer defaults */
@@ -32265,6 +32289,7 @@ static struct sip_peer *build_peer(const char *name, struct ast_variable *v_head
 	peer->the_mark = 0;
 
 	oldacl = ast_free_acl_list(oldacl);
+	oldcontactacl = ast_free_acl_list(oldcontactacl);
 	olddirectmediaacl = ast_free_acl_list(olddirectmediaacl);
 	if (!ast_strlen_zero(peer->callback)) { /* build string from peer info */
 		char *reg_string;
@@ -34399,17 +34424,14 @@ static int peer_iphash_cb(const void *obj, const int flags)
  * This function has two modes.
  *  - If the peer arg does not have INSECURE_PORT set, then we will only return
  *    a match for a peer that matches both the IP and port.
- *  - If the peer arg does have the INSECURE_PORT flag set, then we will only
- *    return a match for a peer that matches the IP and has insecure=port
- *    in its configuration.
+ *  - If the peer arg does have the INSECURE_PORT flag set, then we will return
+ *    a match for UDP peers with insecure=port set, or a peer that does NOT have
+ *    host=dynamic for other protocols (or have a valid Contact: header in REGISTER).
+ * This callback will be used twice when doing peer matching, as per the two modes
+ * described above.
  *
- * This callback will be used twice when doing peer matching.  There is a first
- * pass for full IP+port matching, and a second pass in case there is a match
- * that meets the insecure=port criteria.
- *
- * \note Connections coming in over TCP or TLS should never be matched by port.
- *
- * \note the peer's addr struct provides to fields combined to make a key: the sin_addr.s_addr and sin_port fields.
+ * \note the peer's addr struct provides to fields combined to make a key: the
+ *    sin_addr.s_addr and sin_port fields (transport is compared separately).
  */
 static int peer_ipcmp_cb_full(void *obj, void *arg, void *data, int flags)
 {
@@ -34428,24 +34450,50 @@ static int peer_ipcmp_cb_full(void *obj, void *arg, void *data, int flags)
 		return 0;
 	}
 
-	/* We matched the IP, check to see if we need to match by port as well. */
-	if (((peer->transports & peer2->transports) &
-		(AST_TRANSPORT_UDP | AST_TRANSPORT_WS | AST_TRANSPORT_WSS)) &&
-		ast_test_flag(&peer2->flags[0], SIP_INSECURE_PORT)) {
+	if ((peer->transports & peer2->transports) == 0) {
+		/* transport setting doesn't match */
+		return 0;
+	}
+
+	if (!ast_test_flag(&peer2->flags[0], SIP_INSECURE_PORT)) {
+		/* On the first pass only match if ports match. */
+		return ast_sockaddr_port(&peer->addr) == ast_sockaddr_port(&peer2->addr) ?
+			(CMP_MATCH | CMP_STOP) : 0;
+	}
+
+	/* We can reach here only if peer2 is for SIP_INSECURE_PORT, in
+	 * other words, the second pass where we only try to match against IP.
+	 *
+	 * Some special handling for UDP vs non-UDP (TCP, TLS, WS and WSS), since
+	 * for non-UDP the source port won't typically be controlled, we only want
+	 * to check the source IP, but only if the host isn't dynamic.  This isn't
+	 * done in the first pass so that if a peer registers from the same IP as
+	 * a static IP peer that registration (port match) will take prescedence).
+	 */
+	if (peer2->transports == AST_TRANSPORT_UDP) {
 		/* We are allowing match without port for peers configured that
 		 * way in this pass through the peers. */
 		return ast_test_flag(&peer->flags[0], SIP_INSECURE_PORT) ?
 				(CMP_MATCH | CMP_STOP) : 0;
 	}
 
-	/* Now only return a match if the port matches, as well. */
-	return ast_sockaddr_port(&peer->addr) == ast_sockaddr_port(&peer2->addr) ?
-			(CMP_MATCH | CMP_STOP) : 0;
-}
+	if (!peer->host_dynamic) {
+		return CMP_MATCH | CMP_STOP;
+	}
 
-static int peer_ipcmp_cb(void *obj, void *arg, int flags)
-{
-	return peer_ipcmp_cb_full(obj, arg, NULL, flags);
+	/* Conditions taken from parse_register_contact() */
+	if (peer2->transports & (AST_TRANSPORT_WS | AST_TRANSPORT_WSS)) {
+		/* The contact address of websockets is always the transport source address and port */
+		return 0;
+	}
+
+	if (ast_test_flag(&peer->flags[0], SIP_NAT_FORCE_RPORT)) {
+		/* The contact address of NATed peers is always the transport source address and port */
+		return 0;
+	}
+
+	/* Have to assume that we used the registered contact header (non-NAT) */
+	return CMP_MATCH | CMP_STOP;
 }
 
 static int threadt_hash_cb(const void *obj, const int flags)
@@ -35294,6 +35342,37 @@ static const struct ast_sip_api_tech chan_sip_api_provider = {
 	.sipinfo_send = sipinfo_send,
 };
 
+static void deprecation_notice(void)
+{
+	ast_log(LOG_WARNING, "chan_sip has no official maintainer and is deprecated.  Migration to\n");
+	ast_log(LOG_WARNING, "chan_pjsip is recommended.  See guides at the Asterisk Wiki:\n");
+	ast_log(LOG_WARNING, "https://wiki.asterisk.org/wiki/x/tAHOAQ\n");
+	ast_log(LOG_WARNING, "https://wiki.asterisk.org/wiki/x/hYCLAQ\n");
+}
+
+/*! \brief Event callback which indicates we're fully booted */
+static void startup_event_cb(void *data, struct stasis_subscription *sub, struct stasis_message *message)
+{
+	struct ast_json_payload *payload;
+	const char *type;
+
+	if (stasis_message_type(message) != ast_manager_get_generic_type()) {
+		return;
+	}
+
+	payload = stasis_message_data(message);
+	type = ast_json_string_get(ast_json_object_get(payload->json, "type"));
+
+	if (strcmp(type, "FullyBooted")) {
+		return;
+	}
+
+	deprecation_notice();
+
+	stasis_unsubscribe(sub);
+}
+
+
 static int unload_module(void);
 
 /*!
@@ -35333,12 +35412,18 @@ static int load_module(void)
 
 	/* the fact that ao2_containers can't resize automatically is a major worry! */
 	/* if the number of objects gets above MAX_XXX_BUCKETS, things will slow down */
-	peers = ao2_t_container_alloc(HASH_PEER_SIZE, peer_hash_cb, peer_cmp_cb, "allocate peers");
-	peers_by_ip = ao2_t_container_alloc(HASH_PEER_SIZE, peer_iphash_cb, peer_ipcmp_cb, "allocate peers_by_ip");
-	dialogs = ao2_t_container_alloc(HASH_DIALOG_SIZE, dialog_hash_cb, dialog_cmp_cb, "allocate dialogs");
-	dialogs_needdestroy = ao2_t_container_alloc(1, NULL, NULL, "allocate dialogs_needdestroy");
-	dialogs_rtpcheck = ao2_t_container_alloc(HASH_DIALOG_SIZE, dialog_hash_cb, dialog_cmp_cb, "allocate dialogs for rtpchecks");
-	threadt = ao2_t_container_alloc(HASH_DIALOG_SIZE, threadt_hash_cb, threadt_cmp_cb, "allocate threadt table");
+	peers = ao2_t_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, HASH_PEER_SIZE,
+		peer_hash_cb, NULL, peer_cmp_cb, "allocate peers");
+	peers_by_ip = ao2_t_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, HASH_PEER_SIZE,
+		peer_iphash_cb, NULL, NULL, "allocate peers_by_ip");
+	dialogs = ao2_t_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, HASH_DIALOG_SIZE,
+		dialog_hash_cb, NULL, dialog_cmp_cb, "allocate dialogs");
+	dialogs_needdestroy = ao2_t_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, 1,
+		NULL, NULL, NULL, "allocate dialogs_needdestroy");
+	dialogs_rtpcheck = ao2_t_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, HASH_DIALOG_SIZE,
+		dialog_hash_cb, NULL, dialog_cmp_cb, "allocate dialogs for rtpchecks");
+	threadt = ao2_t_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, HASH_DIALOG_SIZE,
+		threadt_hash_cb, NULL, threadt_cmp_cb, "allocate threadt table");
 	if (!peers || !peers_by_ip || !dialogs || !dialogs_needdestroy || !dialogs_rtpcheck
 		|| !threadt) {
 		ast_log(LOG_ERROR, "Unable to create primary SIP container(s)\n");
@@ -35352,7 +35437,8 @@ static int load_module(void)
 	}
 	ast_format_cap_append_by_type(sip_tech.capabilities, AST_MEDIA_TYPE_AUDIO);
 
-	registry_list = ao2_t_container_alloc(HASH_REGISTRY_SIZE, registry_hash_cb, registry_cmp_cb, "allocate registry_list");
+	registry_list = ao2_t_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, HASH_REGISTRY_SIZE,
+		registry_hash_cb, NULL, registry_cmp_cb, "allocate registry_list");
 	subscription_mwi_list = ao2_t_container_alloc_list(AO2_ALLOC_OPT_LOCK_MUTEX,
 		AO2_CONTAINER_ALLOC_OPT_INSERT_BEGIN, NULL, NULL, "allocate subscription_mwi_list");
 
@@ -35470,7 +35556,9 @@ static int load_module(void)
 		unload_module();
 		return AST_MODULE_LOAD_DECLINE;
 	}
-	if (!(sip_monitor_instances = ao2_container_alloc(37, sip_monitor_instance_hash_fn, sip_monitor_instance_cmp_fn))) {
+	sip_monitor_instances = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, 37,
+		sip_monitor_instance_hash_fn, NULL, sip_monitor_instance_cmp_fn);
+	if (!sip_monitor_instances) {
 		unload_module();
 		return AST_MODULE_LOAD_DECLINE;
 	}
@@ -35498,6 +35586,12 @@ static int load_module(void)
 
 	if (sip_cfg.websocket_enabled) {
 		ast_websocket_add_protocol("sip", sip_websocket_callback);
+	}
+
+	if (ast_fully_booted) {
+		deprecation_notice();
+	} else {
+		stasis_subscribe_pool(ast_manager_get_topic(), startup_event_cb, NULL);
 	}
 
 	return AST_MODULE_LOAD_SUCCESS;
@@ -35717,7 +35811,7 @@ static int unload_module(void)
 }
 
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "Session Initiation Protocol (SIP)",
-	.support_level = AST_MODULE_SUPPORT_CORE,
+	.support_level = AST_MODULE_SUPPORT_DEPRECATED,
 	.load = load_module,
 	.unload = unload_module,
 	.reload = reload,

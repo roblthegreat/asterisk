@@ -807,17 +807,17 @@ unsigned int ast_fax_minrate(void)
 
 static int update_modem_bits(enum ast_fax_modems *bits, const char *value)
 {
-	char *m[5], *tok, *v = (char *)value;
+	char *m[5], *tok, *v = (char *) value, *rest;
 	int i = 0, j;
 
 	if (!strchr(v, ',')) {
 		m[i++] = v;
 		m[i] = NULL;
 	} else {
-		tok = strtok(v, ", ");
+		tok = strtok_r(v, ", ", &rest);
 		while (tok && i < ARRAY_LEN(m) - 1) {
 			m[i++] = tok;
-			tok = strtok(NULL, ", ");
+			tok = strtok_r(NULL, ", ", &rest);
 		}
 		m[i] = NULL;
 	}
@@ -2914,6 +2914,11 @@ static int fax_gateway_start(struct fax_gateway *gateway, struct ast_fax_session
 	struct ast_fax_session *s;
 	int start_res;
 
+	/* if the fax gateway is already started then do nothing */
+	if (gateway->s && gateway->s->state != AST_FAX_STATE_RESERVED) {
+		return 0;
+	}
+
 	/* create the FAX session */
 	if (!(s = fax_session_new(details, chan, gateway->s, gateway->token))) {
 		gateway->token = NULL;
@@ -4719,7 +4724,9 @@ static int load_module(void)
 	/* initialize the registry */
 	faxregistry.active_sessions = 0;
 	faxregistry.reserved_sessions = 0;
-	if (!(faxregistry.container = ao2_container_alloc(FAX_MAXBUCKETS, session_hash_cb, session_cmp_cb))) {
+	faxregistry.container = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		FAX_MAXBUCKETS, session_hash_cb, NULL, session_cmp_cb);
+	if (!faxregistry.container) {
 		return AST_MODULE_LOAD_DECLINE;
 	}
 

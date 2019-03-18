@@ -714,7 +714,7 @@ int ast_publish_device_state_full(
 {
 	RAII_VAR(struct ast_device_state_message *, device_state, NULL, ao2_cleanup);
 	RAII_VAR(struct stasis_message *, message, NULL, ao2_cleanup);
-	struct stasis_topic *device_specific_topic;
+	struct stasis_topic *topic;
 
 	ast_assert(!ast_strlen_zero(device));
 
@@ -733,12 +733,28 @@ int ast_publish_device_state_full(
 		return -1;
 	}
 
-	device_specific_topic = ast_device_state_topic(device);
-	if (!device_specific_topic) {
+	/* When a device state is to be cached it is likely that something
+	 * external will either be monitoring it or will want to pull the
+	 * information from the cache, so we always publish to the device
+	 * specific topic. Cachable updates traditionally come from such things
+	 * as a SIP or PJSIP device.
+	 * When a device state is not to be cached we only publish to its
+	 * specific topic if something has already created the topic. Publishing
+	 * to its topic otherwise would create the topic, which may not be
+	 * necessary as it could be an ephemeral device. Uncachable updates
+	 * traditionally come from such things as Local channels.
+	 */
+	if (cachable || stasis_topic_pool_topic_exists(device_state_topic_pool, device)) {
+		topic = ast_device_state_topic(device);
+	} else {
+		topic = ast_device_state_topic_all();
+	}
+
+	if (!topic) {
 		return -1;
 	}
 
-	stasis_publish(device_specific_topic, message);
+	stasis_publish(topic, message);
 	return 0;
 }
 
@@ -886,7 +902,7 @@ int devstate_init(void)
 	if (STASIS_MESSAGE_TYPE_INIT(ast_device_state_message_type) != 0) {
 		return -1;
 	}
-	device_state_topic_all = stasis_topic_create("ast_device_state_topic");
+	device_state_topic_all = stasis_topic_create("devicestate:all");
 	if (!device_state_topic_all) {
 		return -1;
 	}
@@ -904,6 +920,8 @@ int devstate_init(void)
 	if (!device_state_topic_cached) {
 		return -1;
 	}
+	stasis_caching_accept_message_type(device_state_topic_cached, ast_device_state_message_type());
+	stasis_caching_set_filter(device_state_topic_cached, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 
 	devstate_message_sub = stasis_subscribe(ast_device_state_topic_all(),
 		devstate_change_cb, NULL);
@@ -911,6 +929,8 @@ int devstate_init(void)
 		ast_log(LOG_ERROR, "Failed to create subscription creating uncached device state aggregate events.\n");
 		return -1;
 	}
+	stasis_subscription_accept_message_type(devstate_message_sub, ast_device_state_message_type());
+	stasis_subscription_set_filter(devstate_message_sub, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 
 	return 0;
 }

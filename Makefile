@@ -76,9 +76,6 @@ export AST_DEVMODE_STRICT # Enables shadow warnings (-Wshadow)
 export _SOLINK            # linker flags for all shared objects
 export SOLINK             # linker flags for loadable modules
 export DYLINK             # linker flags for shared libraries
-export STATIC_BUILD       # Additional cflags, set to -static
-                          # for static builds. Probably
-                          # should go directly to ASTLDFLAGS
 
 #--- paths to various commands
 # The makeopts include below tries to set these if they're found during
@@ -766,7 +763,7 @@ upgrade: bininstall
 #  (1) the configuration directory to install from
 #  (2) the extension to strip off
 define INSTALL_CONFIGS
-	@for x in configs/$(1)/*$(2); do \
+	@for x in $(1)/*$(2); do \
 		dst="$(DESTDIR)$(ASTETCDIR)/`$(BASENAME) $$x $(2)`"; \
 		if [ -f "$${dst}" ]; then \
 			if [ "$(OVERWRITE)" = "y" ]; then \
@@ -802,6 +799,14 @@ define INSTALL_CONFIGS
 	fi
 endef
 
+install-configs:
+	@if test -z "$(CONFIG_SRC)" -o ! -d "$(CONFIG_SRC)"; then \
+		>&2 echo "CONFIG_SRC must be set to a directory."; \
+		exit 1; \
+	fi
+	@echo "Installing config files from $(CONFIG_SRC)/*$(CONFIG_EXTEN)"
+	$(call INSTALL_CONFIGS,$(CONFIG_SRC),$(CONFIG_EXTEN))
+
 # XXX why *.adsi is installed first ?
 adsi:
 	@echo Installing adsi config files...
@@ -818,7 +823,7 @@ adsi:
 
 samples: adsi
 	@echo Installing other config files...
-	$(call INSTALL_CONFIGS,samples,.sample)
+	$(call INSTALL_CONFIGS,configs/samples,.sample)
 	$(INSTALL) -d "$(DESTDIR)$(ASTSPOOLDIR)/voicemail/default/1234/INBOX"
 	build_tools/make_sample_voicemail "$(DESTDIR)/$(ASTDATADIR)" "$(DESTDIR)/$(ASTSPOOLDIR)"
 	@for x in phoneprov/*; do \
@@ -841,7 +846,7 @@ samples: adsi
 
 basic-pbx:
 	@echo Installing basic-pbx config files...
-	$(call INSTALL_CONFIGS,basic-pbx)
+	$(call INSTALL_CONFIGS,configs/basic-pbx)
 
 webvmail:
 	@[ -d "$(DESTDIR)$(HTTP_DOCSDIR)/" ] || ( printf "http docs directory not found.\nUpdate assignment of variable HTTP_DOCSDIR in Makefile!\n" && exit 1 )
@@ -941,7 +946,7 @@ config:
 		if [ -z "$(DESTDIR)" ] ; then \
 			/sbin/chkconfig --add asterisk ; \
 		fi ; \
-	elif [ -f /etc/os-release ] && [ "opensuse" = "$(shell . /etc/os-release && echo $$ID)" ] ; then \
+	elif [ -f /etc/os-release ] && [ "opensuse" = "$(shell . /etc/os-release 2>/dev/null && echo $$ID)" ] ; then \
 		./build_tools/install_subst contrib/init.d/rc.suse.asterisk  "$(DESTDIR)/etc/init.d/asterisk"; \
 		if [ ! -f /etc/sysconfig/asterisk ] ; then \
 			$(INSTALL) -m 644 contrib/init.d/etc_default_asterisk "$(DESTDIR)/etc/sysconfig/asterisk" ; \
@@ -953,7 +958,7 @@ config:
 		./build_tools/install_subst contrib/init.d/rc.archlinux.asterisk  "$(DESTDIR)/etc/init.d/asterisk"; \
 	elif [ -f /etc/slackware-version ]; then \
 		./build_tools/install_subst contrib/init.d/rc.slackware.asterisk  "$(DESTDIR)/etc/rc.d/rc.asterisk"; \
-	elif [ -f /etc/os-release ] && [ "slackware" = "$(shell . /etc/os-release && echo $$ID)" ] ; then \
+	elif [ -f /etc/os-release ] && [ "slackware" = "$(shell . /etc/os-release 2>/dev/null && echo $$ID)" ] ; then \
 		./build_tools/install_subst contrib/init.d/rc.slackware.asterisk  "$(DESTDIR)/etc/rc.d/rc.asterisk"; \
 	elif [ -d "$(DESTDIR)/Library/LaunchDaemons" ]; then \
 		if [ ! -f "$(DESTDIR)/Library/LaunchDaemons/org.asterisk.asterisk.plist" ]; then \
@@ -1111,6 +1116,7 @@ check-alembic: makeopts
 	@find contrib/ast-db-manage/ -name '*.pyc' -delete
 	@ALEMBIC=$(ALEMBIC) build_tools/make_check_alembic config cdr voicemail >&2
 
+.PHONY: install-configs
 .PHONY: menuselect
 .PHONY: main
 .PHONY: sounds

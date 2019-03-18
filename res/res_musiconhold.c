@@ -402,11 +402,28 @@ static int ast_moh_files_next(struct ast_channel *chan)
 
 static struct ast_frame *moh_files_readframe(struct ast_channel *chan)
 {
-	struct ast_frame *f = NULL;
+	struct ast_frame *f;
 
-	if (!(ast_channel_stream(chan) && (f = ast_readframe(ast_channel_stream(chan))))) {
-		if (!ast_moh_files_next(chan))
+	f = ast_readframe(ast_channel_stream(chan));
+	if (!f) {
+		/* Either there was no file stream setup or we reached EOF. */
+		if (!ast_moh_files_next(chan)) {
+			/*
+			 * Either we resetup the previously saved file stream position
+			 * or we started a new file stream.
+			 */
 			f = ast_readframe(ast_channel_stream(chan));
+			if (!f) {
+				/*
+				 * We can get here if we were very unlucky because the
+				 * resetup file stream was saved at EOF when MOH was
+				 * previously stopped.
+				 */
+				if (!ast_moh_files_next(chan)) {
+					f = ast_readframe(ast_channel_stream(chan));
+				}
+			}
+		}
 	}
 
 	return f;
@@ -1071,6 +1088,9 @@ static void moh_parse_options(struct ast_variable *var, struct mohclass *mohclas
 			ast_copy_string(mohclass->dir, var->value, sizeof(mohclass->dir));
 		} else if (!strcasecmp(var->name, "application")) {
 			ast_copy_string(mohclass->args, var->value, sizeof(mohclass->args));
+		} else if (!strcasecmp(var->name, "announcement")) {
+			ast_copy_string(mohclass->announcement, var->value, sizeof(mohclass->announcement));
+			ast_set_flag(mohclass, MOH_ANNOUNCEMENT);
 		} else if (!strcasecmp(var->name, "digit") && (isdigit(*var->value) || strchr("*#", *var->value))) {
 			mohclass->digit = *var->value;
 		} else if (!strcasecmp(var->name, "random")) {
@@ -1094,6 +1114,22 @@ static void moh_parse_options(struct ast_variable *var, struct mohclass *mohclas
 			if (!mohclass->format) {
 				ast_log(LOG_WARNING, "Unknown format '%s' -- defaulting to SLIN\n", var->value);
 				mohclass->format = ao2_bump(ast_format_slin);
+			}
+		} else if (!strcasecmp(var->name, "kill_escalation_delay")) {
+			if (sscanf(var->value, "%zu", &mohclass->kill_delay) == 1) {
+				mohclass->kill_delay *= 1000;
+			} else {
+				ast_log(LOG_WARNING, "kill_escalation_delay '%s' is invalid.  Setting to 100ms\n", var->value);
+				mohclass->kill_delay = 100000;
+			}
+		} else if (!strcasecmp(var->name, "kill_method")) {
+			if (!strcasecmp(var->value, "process")) {
+				mohclass->kill_method = KILL_METHOD_PROCESS;
+			} else if (!strcasecmp(var->value, "process_group")) {
+				mohclass->kill_method = KILL_METHOD_PROCESS_GROUP;
+			} else {
+				ast_log(LOG_WARNING, "kill_method '%s' is invalid.  Setting to 'process_group'\n", var->value);
+				mohclass->kill_method = KILL_METHOD_PROCESS_GROUP;
 			}
 		}
 	}
@@ -1761,49 +1797,6 @@ static int load_moh_classes(int reload)
 		/* For compatibility with the past, we overwrite any name=name
 		 * with the context [name]. */
 		ast_copy_string(class->name, cat, sizeof(class->name));
-		for (var = ast_variable_browse(cfg, cat); var; var = var->next) {
-			if (!strcasecmp(var->name, "mode")) {
-				ast_copy_string(class->mode, var->value, sizeof(class->mode));
-			} else if (!strcasecmp(var->name, "directory")) {
-				ast_copy_string(class->dir, var->value, sizeof(class->dir));
-			} else if (!strcasecmp(var->name, "application")) {
-				ast_copy_string(class->args, var->value, sizeof(class->args));
-			} else if (!strcasecmp(var->name, "announcement")) {
-				ast_copy_string(class->announcement, var->value, sizeof(class->announcement));
-				ast_set_flag(class, MOH_ANNOUNCEMENT);
-			} else if (!strcasecmp(var->name, "digit") && (isdigit(*var->value) || strchr("*#", *var->value))) {
-				class->digit = *var->value;
-			} else if (!strcasecmp(var->name, "random")) {
-				ast_set2_flag(class, ast_true(var->value), MOH_RANDOMIZE);
-			} else if (!strcasecmp(var->name, "sort") && !strcasecmp(var->value, "random")) {
-				ast_set_flag(class, MOH_RANDOMIZE);
-			} else if (!strcasecmp(var->name, "sort") && !strcasecmp(var->value, "alpha")) {
-				ast_set_flag(class, MOH_SORTALPHA);
-			} else if (!strcasecmp(var->name, "format")) {
-				ao2_cleanup(class->format);
-				class->format = ast_format_cache_get(var->value);
-				if (!class->format) {
-					ast_log(LOG_WARNING, "Unknown format '%s' -- defaulting to SLIN\n", var->value);
-					class->format = ao2_bump(ast_format_slin);
-				}
-			} else if (!strcasecmp(var->name, "kill_escalation_delay")) {
-				if (sscanf(var->value, "%zu", &class->kill_delay) == 1) {
-					class->kill_delay *= 1000;
-				} else {
-					ast_log(LOG_WARNING, "kill_escalation_delay '%s' is invalid.  Setting to 100ms\n", var->value);
-					class->kill_delay = 100000;
-				}
-			} else if (!strcasecmp(var->name, "kill_method")) {
-				if (!strcasecmp(var->value, "process")) {
-					class->kill_method = KILL_METHOD_PROCESS;
-				} else if (!strcasecmp(var->value, "process_group")){
-					class->kill_method = KILL_METHOD_PROCESS_GROUP;
-				} else {
-					ast_log(LOG_WARNING, "kill_method '%s' is invalid.  Setting to 'process_group'\n", var->value);
-					class->kill_method = KILL_METHOD_PROCESS_GROUP;
-				}
-			}
-		}
 
 		if (ast_strlen_zero(class->dir)) {
 			if (!strcasecmp(class->mode, "custom")) {
@@ -1988,7 +1981,9 @@ static int load_module(void)
 {
 	int res;
 
-	if (!(mohclasses = ao2_t_container_alloc(53, moh_class_hash, moh_class_cmp, "Moh class container"))) {
+	mohclasses = ao2_t_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, 53,
+		moh_class_hash, NULL, moh_class_cmp, "Moh class container");
+	if (!mohclasses) {
 		return AST_MODULE_LOAD_DECLINE;
 	}
 

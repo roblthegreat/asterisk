@@ -96,18 +96,6 @@
 				<parameter name="RoundtripUsec">
 					<para>The RTT measured during the last qualify.</para>
 				</parameter>
-				<parameter name="UserAgent">
-					<para>Content of the User-Agent header in REGISTER request</para>
-				</parameter>
-				<parameter name="RegExpire">
-					<para>Absolute time that this contact is no longer valid after</para>
-				</parameter>
-				<parameter name="ViaAddress">
-					<para>IP address:port of the last Via header in REGISTER request</para>
-				</parameter>
-				<parameter name="CallID">
-					<para>Content of the Call-ID header in REGISTER request</para>
-				</parameter>
 			</syntax>
 		</managerEventInstance>
 	</managerEvent>
@@ -472,7 +460,7 @@ int ast_endpoint_stasis_init(void)
 	int res = 0;
 	ast_register_cleanup(endpoints_stasis_cleanup);
 
-	endpoint_cache_all = stasis_cp_all_create("endpoint_topic_all",
+	endpoint_cache_all = stasis_cp_all_create("endpoint:all",
 		endpoint_snapshot_get_id);
 	if (!endpoint_cache_all) {
 		return -1;

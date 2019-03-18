@@ -6,6 +6,9 @@
 
 #include "asterisk/buildopts.h" /* IWYU pragma: export */
 
+/* Define to 'long' or 'long long' */
+#undef AST_JSON_INT_T
+
 /* Define to 1 if internal poll should be used. */
 #undef AST_POLL_COMPAT
 
@@ -407,8 +410,11 @@
 /* Define to 1 if you have the Jack Audio Connection Kit library. */
 #undef HAVE_JACK
 
-/* Define to 1 if you have the Jansson JSON library library. */
+/* Define if your system has the JANSSON libraries. */
 #undef HAVE_JANSSON
+
+/* Define if your system has JANSSON_BUNDLED */
+#undef HAVE_JANSSON_BUNDLED
 
 /* Define to 1 if you have the `kevent64' function. */
 #undef HAVE_KEVENT64
@@ -485,6 +491,9 @@
 
 /* Define to 1 if you have the <malloc.h> header file. */
 #undef HAVE_MALLOC_H
+
+/* Define to 1 if you have the `malloc_trim' function. */
+#undef HAVE_MALLOC_TRIM
 
 /* Define to 1 if you have the <math.h> header file. */
 #undef HAVE_MATH_H
@@ -573,9 +582,6 @@
 /* Define to 1 if you have the OpenSSL Secure Sockets Layer library. */
 #undef HAVE_OPENSSL
 
-/* Define to 1 if CRYPTO has the OpenSSL Elliptic Curve Support feature. */
-#undef HAVE_OPENSSL_EC
-
 /* Define to 1 if CRYPTO has the OpenSSL SRTP Extension Support feature. */
 #undef HAVE_OPENSSL_SRTP
 
@@ -603,6 +609,9 @@
 /* Define to indicate presence of the pg_encoding_to_char API. */
 #undef HAVE_PGSQL_pg_encoding_to_char
 
+/* Define to 1 if you have the `pipe2' function. */
+#undef HAVE_PIPE2
+
 /* Define if your system has the PJPROJECT libraries. */
 #undef HAVE_PJPROJECT
 
@@ -616,6 +625,9 @@
    Lock feature. */
 #undef HAVE_PJSIP_DLG_CREATE_UAS_AND_INC_LOCK
 
+/* Define if your system has the PJSIP_ENDPOINT_COMPACT_FORM headers. */
+#undef HAVE_PJSIP_ENDPOINT_COMPACT_FORM
+
 /* Define to 1 if PJPROJECT has the PJSIP EVSUB Group Lock support feature. */
 #undef HAVE_PJSIP_EVSUB_GRP_LOCK
 
@@ -626,15 +638,26 @@
 /* Define to 1 if PJPROJECT has the pjsip_get_dest_info support feature. */
 #undef HAVE_PJSIP_GET_DEST_INFO
 
+/* Define if your system has the PJSIP_INV_ACCEPT_MULTIPLE_SDP_ANSWERS
+   headers. */
+#undef HAVE_PJSIP_INV_ACCEPT_MULTIPLE_SDP_ANSWERS
+
 /* Define to 1 if PJPROJECT has the PJSIP INVITE Session Reference Count
    support feature. */
 #undef HAVE_PJSIP_INV_SESSION_REF
+
+/* Define if your system has the PJSIP_OAUTH_AUTHENTICATION headers. */
+#undef HAVE_PJSIP_OAUTH_AUTHENTICATION
 
 /* Define if your system has the PJSIP_REPLACE_MEDIA_STREAM headers. */
 #undef HAVE_PJSIP_REPLACE_MEDIA_STREAM
 
 /* Define if your system has the PJSIP_TLS_TRANSPORT_PROTO headers. */
 #undef HAVE_PJSIP_TLS_TRANSPORT_PROTO
+
+/* Define if your system has the PJSIP_TRANSPORT_DISABLE_CONNECTION_REUSE
+   headers. */
+#undef HAVE_PJSIP_TRANSPORT_DISABLE_CONNECTION_REUSE
 
 /* Define to 1 if PJPROJECT has the pjsip_tsx_layer_find_tsx2 support feature.
    */
@@ -864,6 +887,9 @@
 /* Define to 1 if you have the `socket' function. */
 #undef HAVE_SOCKET
 
+/* Define to 1 if your socket() implementation can accept SOCK_NONBLOCK. */
+#undef HAVE_SOCK_NONBLOCK
+
 /* Define to 1 if your system has soxmix application. */
 #undef HAVE_SOXMIX
 
@@ -903,6 +929,9 @@
 /* Define to 1 if SRTP has the SRTP Library AES-128 (GCM) and AES-256 (GCM)
    feature. */
 #undef HAVE_SRTP_GCM
+
+/* Define to 1 if SRTP has the SRTP Library Version Function feature. */
+#undef HAVE_SRTP_GET_VERSION
 
 /* Define to 1 if SRTP has the SRTP Library Shutdown Function feature. */
 #undef HAVE_SRTP_SHUTDOWN
@@ -1166,9 +1195,6 @@
 
 /* Define to 1 if you have the unbound library. */
 #undef HAVE_UNBOUND
-
-/* Define if your system has UNBOUND_VERSION_MAJOR declared. */
-#undef HAVE_UNBOUND_CONST_PARAMS
 
 /* Define to 1 if you have the <unistd.h> header file. */
 #undef HAVE_UNISTD_H

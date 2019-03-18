@@ -941,10 +941,6 @@ int ast_get_txt(struct ast_channel *chan, const char *number, char *txt, int txt
 
 	ast_debug(4, "ast_get_txt: Number = '%s', suffix = '%s'\n", number, suffix);
 
-	if (chan && ast_autoservice_start(chan) < 0) {
-		return -1;
-	}
-
 	if (pos > 128) {
 		pos = 128;
 	}
@@ -964,9 +960,6 @@ int ast_get_txt(struct ast_channel *chan, const char *number, char *txt, int txt
 		ret = 0;
 	} else {
 		ast_copy_string(txt, context.txt, txtlen);
-	}
-	if (chan) {
-		ret |= ast_autoservice_stop(chan);
 	}
 	return ret;
 }
@@ -1030,4 +1023,5 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_
 	.unload = unload_module,
 	.reload = reload_module,
 	.load_pri = AST_MODPRI_CORE,
+	.requires = "extconfig",
 );

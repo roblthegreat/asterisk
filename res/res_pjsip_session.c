@@ -48,6 +48,7 @@
 #include "asterisk/pickup.h"
 #include "asterisk/test.h"
 #include "asterisk/stream.h"
+#include "asterisk/vector.h"
 
 #define SDP_HANDLER_BUCKETS 11
 
@@ -58,6 +59,9 @@
 #define DEFAULT_NUM_SESSION_MEDIA 2
 
 /* Some forward declarations */
+static void handle_session_begin(struct ast_sip_session *session);
+static void handle_session_end(struct ast_sip_session *session);
+static void handle_session_destroy(struct ast_sip_session *session);
 static void handle_incoming_request(struct ast_sip_session *session, pjsip_rx_data *rdata);
 static void handle_incoming_response(struct ast_sip_session *session, pjsip_rx_data *rdata,
 		enum ast_sip_session_response_priority response_priority);
@@ -173,6 +177,16 @@ void ast_sip_session_unregister_sdp_handler(struct ast_sip_session_sdp_handler *
 	ao2_callback_data(sdp_handlers, OBJ_KEY | OBJ_UNLINK | OBJ_NODATA, remove_handler, (void *)stream_type, handler);
 }
 
+static int media_stats_local_ssrc_cmp(
+		const struct ast_rtp_instance_stats *vec_elem, const struct ast_rtp_instance_stats *srch)
+{
+	if (vec_elem->local_ssrc == srch->local_ssrc) {
+		return 1;
+	}
+
+	return 0;
+}
+
 static struct ast_sip_session_media_state *internal_sip_session_media_state_alloc(
 	size_t sessions, size_t read_callbacks)
 {
@@ -201,6 +215,40 @@ struct ast_sip_session_media_state *ast_sip_session_media_state_alloc(void)
 {
 	return internal_sip_session_media_state_alloc(
 		DEFAULT_NUM_SESSION_MEDIA, DEFAULT_NUM_SESSION_MEDIA);
+}
+
+void ast_sip_session_media_stats_save(struct ast_sip_session *sip_session, struct ast_sip_session_media_state *media_state)
+{
+	int i;
+	int ret;
+
+	if (!media_state || !sip_session) {
+		return;
+	}
+
+	for (i = 0; i < AST_VECTOR_SIZE(&media_state->sessions); i++) {
+		struct ast_rtp_instance_stats *stats_tmp = NULL;
+		struct ast_sip_session_media *media = AST_VECTOR_GET(&media_state->sessions, i);
+		if (!media || !media->rtp) {
+			continue;
+		}
+
+		stats_tmp = ast_calloc(1, sizeof(struct ast_rtp_instance_stats));
+		if (!stats_tmp) {
+			return;
+		}
+
+		ret = ast_rtp_instance_get_stats(media->rtp, stats_tmp, AST_RTP_INSTANCE_STAT_ALL);
+		if (ret) {
+			ast_free(stats_tmp);
+			continue;
+		}
+
+		/* remove all the duplicated stats if exist */
+		AST_VECTOR_REMOVE_CMP_UNORDERED(&sip_session->media_stats, stats_tmp, media_stats_local_ssrc_cmp, ast_free);
+
+		AST_VECTOR_APPEND(&sip_session->media_stats, stats_tmp);
+	}
 }
 
 void ast_sip_session_media_state_reset(struct ast_sip_session_media_state *media_state)
@@ -250,7 +298,10 @@ struct ast_sip_session_media_state *ast_sip_session_media_state_clone(const stru
 		struct ast_sip_session_media *session_media = AST_VECTOR_GET(&media_state->sessions, index);
 		enum ast_media_type type = ast_stream_get_type(ast_stream_topology_get_stream(cloned->topology, index));
 
-		AST_VECTOR_REPLACE(&cloned->sessions, index, ao2_bump(session_media));
+		ao2_bump(session_media);
+		if (AST_VECTOR_REPLACE(&cloned->sessions, index, session_media)) {
+			ao2_cleanup(session_media);
+		}
 		if (ast_stream_get_state(ast_stream_topology_get_stream(cloned->topology, index)) != AST_STREAM_STATE_REMOVED &&
 			!cloned->default_session[type]) {
 			cloned->default_session[type] = session_media;
@@ -441,6 +492,8 @@ struct ast_sip_session_media *ast_sip_session_media_state_add(struct ast_sip_ses
 		}
 
 		session_media->encryption = session->endpoint->media.rtp.encryption;
+		session_media->remote_ice = session->endpoint->media.rtp.ice_support;
+		session_media->remote_rtcp_mux = session->endpoint->media.rtcp_mux;
 		session_media->keepalive_sched_id = -1;
 		session_media->timeout_sched_id = -1;
 		session_media->type = type;
@@ -926,10 +979,18 @@ static int handle_negotiated_sdp(struct ast_sip_session *session, const pjmedia_
 		session_media = AST_VECTOR_GET(&session->pending_media_state->sessions, i);
 		stream = ast_stream_topology_get_stream(session->pending_media_state->topology, i);
 
-		/* The stream state will have already been set to removed when either we
-		 * negotiate the incoming SDP stream or when we produce our own local SDP.
-		 * This can occur if an internal thing has requested it to be removed, or if
-		 * we remove it as a result of the stream limit being reached.
+		/* Make sure that this stream is in the correct state. If we need to change
+		 * the state to REMOVED, then our work here is done, so go ahead and move on
+		 * to the next stream.
+		 */
+		if (!remote->media[i]->desc.port) {
+			ast_stream_set_state(stream, AST_STREAM_STATE_REMOVED);
+			continue;
+		}
+
+		/* If the stream state is REMOVED, nothing needs to be done, so move on to the
+		 * next stream. This can occur if an internal thing has requested it to be
+		 * removed, or if we remove it as a result of the stream limit being reached.
 		 */
 		if (ast_stream_get_state(stream) == AST_STREAM_STATE_REMOVED) {
 			/*
@@ -994,6 +1055,7 @@ static int handle_negotiated_sdp(struct ast_sip_session *session, const pjmedia_
 	}
 
 	/* Active and pending flip flop as needed */
+	ast_sip_session_media_stats_save(session, session->active_media_state);
 	SWAP(session->active_media_state, session->pending_media_state);
 	ast_sip_session_media_state_reset(session->pending_media_state);
 
@@ -1391,8 +1453,10 @@ static void set_from_header(struct ast_sip_session *session)
 	struct ast_party_id connected_id;
 	pj_pool_t *dlg_pool;
 	pjsip_fromto_hdr *dlg_info;
+	pjsip_contact_hdr *dlg_contact;
 	pjsip_name_addr *dlg_info_name_addr;
 	pjsip_sip_uri *dlg_info_uri;
+	pjsip_sip_uri *dlg_contact_uri;
 	int restricted;
 
 	if (!session->channel || session->saved_from_hdr) {
@@ -1413,11 +1477,16 @@ static void set_from_header(struct ast_sip_session *session)
 
 	dlg_pool = session->inv_session->dlg->pool;
 	dlg_info = session->inv_session->dlg->local.info;
+	dlg_contact = session->inv_session->dlg->local.contact;
 	dlg_info_name_addr = (pjsip_name_addr *) dlg_info->uri;
 	dlg_info_uri = pjsip_uri_get_uri(dlg_info_name_addr);
+	dlg_contact_uri = (pjsip_sip_uri*)pjsip_uri_get_uri(dlg_contact->uri);
 
 	if (session->endpoint->id.trust_outbound || !restricted) {
 		ast_sip_modify_id_header(dlg_pool, dlg_info, &connected_id);
+		if (ast_sip_get_use_callerid_contact() && ast_strlen_zero(session->endpoint->contact_user)) {
+			pj_strdup2(dlg_pool, &dlg_contact_uri->user, S_COR(connected_id.number.valid, connected_id.number.str, ""));
+		}
 	}
 
 	ast_party_id_free(&connected_id);
@@ -1445,6 +1514,10 @@ static void set_from_header(struct ast_sip_session *session)
 
 		if (ast_strlen_zero(session->endpoint->fromuser)) {
 			pj_strdup2(dlg_pool, &dlg_info_uri->user, "anonymous");
+		}
+
+		if (ast_sip_get_use_callerid_contact() && ast_strlen_zero(session->endpoint->contact_user)) {
+			pj_strdup2(dlg_pool, &dlg_contact_uri->user, "anonymous");
 		}
 
 		if (ast_strlen_zero(session->endpoint->fromdomain)) {
@@ -1559,6 +1632,11 @@ int ast_sip_session_refresh(struct ast_sip_session *session,
 
 				/* No need to do anything with stream if it's media state is removed */
 				if (ast_stream_get_state(stream) == AST_STREAM_STATE_REMOVED) {
+					/* If there is no existing stream we can just not have this stream in the topology at all. */
+					if (!existing_stream) {
+						ast_stream_topology_del_stream(media_state->topology, index);
+						index -= 1;
+					}
 					continue;
 				}
 
@@ -2059,7 +2137,6 @@ static int datastore_cmp(void *obj, void *arg, int flags)
 static void session_destructor(void *obj)
 {
 	struct ast_sip_session *session = obj;
-	struct ast_sip_session_supplement *supplement;
 	struct ast_sip_session_delayed_request *delay;
 	const char *endpoint_name = session->endpoint ?
 		ast_sorcery_object_get_id(session->endpoint) : "<none>";
@@ -2075,19 +2152,22 @@ static void session_destructor(void *obj)
 		, session->contact ? ast_sorcery_object_get_id(session->contact) : "<none>"
 		);
 
-	while ((supplement = AST_LIST_REMOVE_HEAD(&session->supplements, next))) {
-		if (supplement->session_destroy) {
-			supplement->session_destroy(session);
-		}
-		ast_free(supplement);
-	}
+	/* fire session destroy handler */
+	handle_session_destroy(session);
+
+	/* remove all registered supplements */
+	ast_sip_session_remove_supplements(session);
+	AST_LIST_HEAD_DESTROY(&session->supplements);
+
+	/* remove all saved media stats */
+	AST_VECTOR_RESET(&session->media_stats, ast_free);
+	AST_VECTOR_FREE(&session->media_stats);
 
 	ast_taskprocessor_unreference(session->serializer);
 	ao2_cleanup(session->datastores);
 	ast_sip_session_media_state_free(session->active_media_state);
 	ast_sip_session_media_state_free(session->pending_media_state);
 
-	AST_LIST_HEAD_DESTROY(&session->supplements);
 	while ((delay = AST_LIST_REMOVE_HEAD(&session->delayed_requests, next))) {
 		delayed_request_free(delay);
 	}
@@ -2136,7 +2216,6 @@ struct ast_sip_session *ast_sip_session_alloc(struct ast_sip_endpoint *endpoint,
 {
 	RAII_VAR(struct ast_sip_session *, session, NULL, ao2_cleanup);
 	struct ast_sip_session *ret_session;
-	struct ast_sip_session_supplement *iter;
 	int dsp_features = 0;
 
 	session = ao2_alloc(sizeof(*session), session_destructor);
@@ -2152,7 +2231,8 @@ struct ast_sip_session *ast_sip_session_alloc(struct ast_sip_endpoint *endpoint,
 	if (!session->direct_media_cap) {
 		return NULL;
 	}
-	session->datastores = ao2_container_alloc(DATASTORE_BUCKETS, datastore_hash, datastore_cmp);
+	session->datastores = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		DATASTORE_BUCKETS, datastore_hash, NULL, datastore_cmp);
 	if (!session->datastores) {
 		return NULL;
 	}
@@ -2162,6 +2242,9 @@ struct ast_sip_session *ast_sip_session_alloc(struct ast_sip_endpoint *endpoint,
 	}
 	session->pending_media_state = ast_sip_session_media_state_alloc();
 	if (!session->pending_media_state) {
+		return NULL;
+	}
+	if (AST_VECTOR_INIT(&session->media_stats, 1) < 0) {
 		return NULL;
 	}
 
@@ -2217,11 +2300,9 @@ struct ast_sip_session *ast_sip_session_alloc(struct ast_sip_endpoint *endpoint,
 		ao2_ref(session, -1);
 		return NULL;
 	}
-	AST_LIST_TRAVERSE(&session->supplements, iter, next) {
-		if (iter->session_begin) {
-			iter->session_begin(session);
-		}
-	}
+
+	/* Fire seesion begin handlers */
+	handle_session_begin(session);
 
 	/* Avoid unnecessary ref manipulation to return a session */
 	ret_session = session;
@@ -2609,6 +2690,7 @@ void ast_sip_session_terminate(struct ast_sip_session *session, int response)
 	 * places when the session is to be terminated we terminate any existing
 	 * media sessions here.
 	 */
+	ast_sip_session_media_stats_save(session, session->active_media_state);
 	SWAP(session->active_media_state, session->pending_media_state);
 	ast_sip_session_media_state_reset(session->pending_media_state);
 
@@ -2918,6 +3000,7 @@ static int new_invite(struct new_invite *invite)
 	pjsip_timer_setting timer;
 	pjsip_rdata_sdp_info *sdp_info;
 	pjmedia_sdp_session *local = NULL;
+	char buffer[AST_SOCKADDR_BUFLEN];
 
 	/* From this point on, any calls to pjsip_inv_terminate have the last argument as PJ_TRUE
 	 * so that we will be notified so we can destroy the session properly
@@ -2945,8 +3028,11 @@ static int new_invite(struct new_invite *invite)
 		}
 		goto end;
 	case SIP_GET_DEST_EXTEN_PARTIAL:
-		ast_debug(1, "Call from '%s' (%s:%s:%d) to extension '%s' - partial match\n", ast_sorcery_object_get_id(invite->session->endpoint),
-			invite->rdata->tp_info.transport->type_name, invite->rdata->pkt_info.src_name, invite->rdata->pkt_info.src_port, invite->session->exten);
+		ast_debug(1, "Call from '%s' (%s:%s) to extension '%s' - partial match\n",
+			ast_sorcery_object_get_id(invite->session->endpoint),
+			invite->rdata->tp_info.transport->type_name,
+			pj_sockaddr_print(&invite->rdata->pkt_info.src_addr, buffer, sizeof(buffer), 3),
+			invite->session->exten);
 
 		if (pjsip_inv_initial_answer(invite->session->inv_session, invite->rdata, 484, NULL, NULL, &tdata) == PJ_SUCCESS) {
 			ast_sip_session_send_response(invite->session, tdata);
@@ -2956,9 +3042,12 @@ static int new_invite(struct new_invite *invite)
 		goto end;
 	case SIP_GET_DEST_EXTEN_NOT_FOUND:
 	default:
-		ast_log(LOG_NOTICE, "Call from '%s' (%s:%s:%d) to extension '%s' rejected because extension not found in context '%s'.\n",
-			ast_sorcery_object_get_id(invite->session->endpoint), invite->rdata->tp_info.transport->type_name, invite->rdata->pkt_info.src_name,
-			invite->rdata->pkt_info.src_port, invite->session->exten, invite->session->endpoint->context);
+		ast_log(LOG_NOTICE, "Call from '%s' (%s:%s) to extension '%s' rejected because extension not found in context '%s'.\n",
+			ast_sorcery_object_get_id(invite->session->endpoint),
+			invite->rdata->tp_info.transport->type_name,
+			pj_sockaddr_print(&invite->rdata->pkt_info.src_addr, buffer, sizeof(buffer), 3),
+			invite->session->exten,
+			invite->session->endpoint->context);
 
 		if (pjsip_inv_initial_answer(invite->session->inv_session, invite->rdata, 404, NULL, NULL, &tdata) == PJ_SUCCESS) {
 			ast_sip_session_send_response(invite->session, tdata);
@@ -3279,6 +3368,40 @@ static void handle_incoming_request(struct ast_sip_session *session, pjsip_rx_da
 	}
 }
 
+static void handle_session_begin(struct ast_sip_session *session)
+{
+	struct ast_sip_session_supplement *iter;
+
+	AST_LIST_TRAVERSE(&session->supplements, iter, next) {
+		if (iter->session_begin) {
+			iter->session_begin(session);
+		}
+	}
+}
+
+static void handle_session_destroy(struct ast_sip_session *session)
+{
+	struct ast_sip_session_supplement *iter;
+
+	AST_LIST_TRAVERSE(&session->supplements, iter, next) {
+		if (iter->session_destroy) {
+			iter->session_destroy(session);
+		}
+	}
+}
+
+static void handle_session_end(struct ast_sip_session *session)
+{
+	struct ast_sip_session_supplement *iter;
+
+	/* Session is dead.  Notify the supplements. */
+	AST_LIST_TRAVERSE(&session->supplements, iter, next) {
+		if (iter->session_end) {
+			iter->session_end(session);
+		}
+	}
+}
+
 static void handle_incoming_response(struct ast_sip_session *session, pjsip_rx_data *rdata,
 		enum ast_sip_session_response_priority response_priority)
 {
@@ -3319,6 +3442,9 @@ static void handle_outgoing_request(struct ast_sip_session *session, pjsip_tx_da
 	struct pjsip_request_line req = tdata->msg->line.req;
 
 	ast_debug(3, "Method is %.*s\n", (int) pj_strlen(&req.method.name), pj_strbuf(&req.method.name));
+
+	ast_sip_message_apply_transport(session->endpoint->transport, tdata);
+
 	AST_LIST_TRAVERSE(&session->supplements, supplement, next) {
 		if (supplement->outgoing_request && does_method_match(&req.method.name, supplement->method)) {
 			supplement->outgoing_request(session, tdata);
@@ -3341,6 +3467,8 @@ static void handle_outgoing_response(struct ast_sip_session *session, pjsip_tx_d
 		pj_strbuf(&cseq->method.name), status.code, (int) pj_strlen(&status.reason),
 		pj_strbuf(&status.reason));
 
+	ast_sip_message_apply_transport(session->endpoint->transport, tdata);
+
 	AST_LIST_TRAVERSE(&session->supplements, supplement, next) {
 		if (supplement->outgoing_response && does_method_match(&cseq->method.name, supplement->method)) {
 			supplement->outgoing_response(session, tdata);
@@ -3351,17 +3479,13 @@ static void handle_outgoing_response(struct ast_sip_session *session, pjsip_tx_d
 static int session_end(void *vsession)
 {
 	struct ast_sip_session *session = vsession;
-	struct ast_sip_session_supplement *iter;
 
 	/* Stop the scheduled termination */
 	sip_session_defer_termination_stop_timer(session);
 
 	/* Session is dead.  Notify the supplements. */
-	AST_LIST_TRAVERSE(&session->supplements, iter, next) {
-		if (iter->session_end) {
-			iter->session_end(session);
-		}
-	}
+	handle_session_end(session);
+
 	return 0;
 }
 
@@ -3843,14 +3967,14 @@ static int add_bundle_groups(struct ast_sip_session *session, pj_pool_t *pool, p
 				continue;
 			}
 
-			ast_str_set(&bundle_group->attr_string, -1, "BUNDLE %s", session_media->mid);
+			ast_str_set(&bundle_group->attr_string, 0, "BUNDLE %s", session_media->mid);
 			continue;
 		}
 
 		for (mid_id = 1; mid_id < PJMEDIA_MAX_SDP_MEDIA; ++mid_id) {
 			if (!bundle_group->mids[mid_id]) {
 				bundle_group->mids[mid_id] = session_media->mid;
-				ast_str_append(&bundle_group->attr_string, -1, " %s", session_media->mid);
+				ast_str_append(&bundle_group->attr_string, 0, " %s", session_media->mid);
 				break;
 			} else if (!strcmp(bundle_group->mids[mid_id], session_media->mid)) {
 				break;
@@ -4050,6 +4174,42 @@ static void session_inv_on_media_update(pjsip_inv_session *inv, pj_status_t stat
 		return;
 	}
 
+	if (session->endpoint) {
+		int bail = 0;
+
+		/*
+		 * If following_fork is set, then this is probably the result of a
+		 * forked INVITE and SDP asnwers coming from the different fork UAS
+		 * destinations.  In this case updated_sdp_answer will also be set.
+		 *
+		 * If only updated_sdp_answer is set, then this is the non-forking
+		 * scenario where the same UAS just needs to change something like
+		 * the media port.
+		 */
+
+		if (inv->following_fork) {
+			if (session->endpoint->media.rtp.follow_early_media_fork) {
+				ast_debug(3, "Following early media fork with different To tags\n");
+			} else {
+				ast_debug(3, "Not following early media fork with different To tags\n");
+				bail = 1;
+			}
+		}
+#ifdef HAVE_PJSIP_INV_ACCEPT_MULTIPLE_SDP_ANSWERS
+		else if (inv->updated_sdp_answer) {
+			if (session->endpoint->media.rtp.accept_multiple_sdp_answers) {
+				ast_debug(3, "Accepting updated SDP with same To tag\n");
+			} else {
+				ast_debug(3, "Ignoring updated SDP answer with same To tag\n");
+				bail = 1;
+			}
+		}
+#endif
+		if (bail) {
+			return;
+		}
+	}
+
 	if ((status != PJ_SUCCESS) || (pjmedia_sdp_neg_get_active_local(inv->neg, &local) != PJ_SUCCESS) ||
 		(pjmedia_sdp_neg_get_active_remote(inv->neg, &remote) != PJ_SUCCESS)) {
 		ast_channel_hangupcause_set(session->channel, AST_CAUSE_BEARERCAPABILITY_NOTAVAIL);
@@ -4194,8 +4354,8 @@ static int load_module(void)
 	}
 	nat_hook->outgoing_external_message = session_outgoing_nat_hook;
 	ast_sorcery_create(ast_sip_get_sorcery(), nat_hook);
-	sdp_handlers = ao2_container_alloc(SDP_HANDLER_BUCKETS,
-			sdp_handler_list_hash, sdp_handler_list_cmp);
+	sdp_handlers = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		SDP_HANDLER_BUCKETS, sdp_handler_list_hash, NULL, sdp_handler_list_cmp);
 	if (!sdp_handlers) {
 		return AST_MODULE_LOAD_DECLINE;
 	}

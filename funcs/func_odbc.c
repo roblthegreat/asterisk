@@ -462,7 +462,7 @@ static SQLHSTMT execute(struct odbc_obj *obj, void *data, int silent)
 		return NULL;
 	}
 
-	res = SQLExecDirect(stmt, (unsigned char *)sql, SQL_NTS);
+	res = ast_odbc_execute_sql(obj, stmt, sql);
 	if ((res != SQL_SUCCESS) && (res != SQL_SUCCESS_WITH_INFO) && (res != SQL_NO_DATA)) {
 		if (res == SQL_ERROR && !silent) {
 			int i;
@@ -855,6 +855,21 @@ static int acf_odbc_read(struct ast_channel *chan, const char *cmd, char *s, cha
 		}
 		odbc_datastore_free(resultset);
 		return -1;
+	}
+
+	if (colcount <= 0) {
+		ast_verb(4, "Returned %d columns [%s]\n", colcount, ast_str_buffer(sql));
+		buf[0] = '\0';
+		SQLCloseCursor(stmt);
+		SQLFreeHandle (SQL_HANDLE_STMT, stmt);
+		release_obj_or_dsn (&obj, &dsn);
+		if (!bogus_chan) {
+			pbx_builtin_setvar_helper(chan, "ODBCROWS", "0");
+			pbx_builtin_setvar_helper(chan, "ODBCSTATUS", "NODATA");
+			ast_autoservice_stop(chan);
+		}
+		odbc_datastore_free(resultset);
+		return 0;
 	}
 
 	res = SQLFetch(stmt);
@@ -1520,6 +1535,15 @@ static char *cli_odbc_read(struct ast_cli_entry *e, int cmd, struct ast_cli_args
 				return CLI_SUCCESS;
 			}
 
+			if (colcount <= 0) {
+				SQLCloseCursor(stmt);
+				SQLFreeHandle (SQL_HANDLE_STMT, stmt);
+				release_obj_or_dsn (&obj, &dsn);
+				ast_cli(a->fd, "Returned %d columns.  Query executed on handle %d:%s [%s]\n", colcount, dsn_num, query->readhandle[dsn_num], ast_str_buffer(sql));
+				AST_RWLIST_UNLOCK(&queries);
+				return CLI_SUCCESS;
+			}
+
 			res = SQLFetch(stmt);
 			if ((res != SQL_SUCCESS) && (res != SQL_SUCCESS_WITH_INFO)) {
 				SQLCloseCursor(stmt);
@@ -1769,7 +1793,8 @@ static int load_module(void)
 	dsns = NULL;
 
 	if (single_db_connection) {
-		dsns = ao2_container_alloc(DSN_BUCKETS, dsn_hash, dsn_cmp);
+		dsns = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, DSN_BUCKETS,
+			dsn_hash, NULL, dsn_cmp);
 		if (!dsns) {
 			ast_log(LOG_ERROR, "Could not initialize DSN container\n");
 			ast_rwlock_unlock(&single_db_connection_lock);
@@ -1867,7 +1892,8 @@ static int reload(void)
 	}
 
 	if (single_db_connection) {
-		dsns = ao2_container_alloc(DSN_BUCKETS, dsn_hash, dsn_cmp);
+		dsns = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, DSN_BUCKETS,
+			dsn_hash, NULL, dsn_cmp);
 		if (!dsns) {
 			ast_log(LOG_ERROR, "Could not initialize DSN container\n");
 			ast_rwlock_unlock(&single_db_connection_lock);

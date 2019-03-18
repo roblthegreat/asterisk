@@ -114,7 +114,7 @@ static void stasis_app_message_handler(
 				"Queued '%s' message for Stasis app '%s'; websocket is not ready\n",
 				msg_type,
 				msg_application);
-	} else {
+	} else if (stasis_app_event_allowed(app_name, message)) {
 		if (stasis_app_get_debug_by_name(app_name)) {
 			char *str = ast_json_dump_string_format(message, ast_ari_json_format());
 
@@ -467,9 +467,8 @@ void ast_ari_websocket_events_event_websocket_dtor(void)
 int ast_ari_websocket_events_event_websocket_init(void)
 {
 	/* Try to instantiate the registry */
-	event_session_registry = ao2_container_alloc(EVENT_SESSION_NUM_BUCKETS,
-	                                             event_session_hash,
-	                                             event_session_compare);
+	event_session_registry = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
+		EVENT_SESSION_NUM_BUCKETS, event_session_hash, NULL, event_session_compare);
 	if (!event_session_registry) {
 		/* This is bad, bad. */
 		ast_log(LOG_WARNING,

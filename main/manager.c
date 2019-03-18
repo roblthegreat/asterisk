@@ -1527,6 +1527,8 @@ static void acl_change_stasis_subscribe(void)
 	if (!acl_change_sub) {
 		acl_change_sub = stasis_subscribe(ast_security_topic(),
 			acl_change_stasis_cb, NULL);
+		stasis_subscription_accept_message_type(acl_change_sub, ast_named_acl_change_type());
+		stasis_subscription_set_filter(acl_change_sub, STASIS_SUBSCRIPTION_FILTER_SELECTIVE);
 	}
 }
 
@@ -2222,8 +2224,8 @@ static struct mansession_session *build_mansession(const struct ast_sockaddr *ad
 		return NULL;
 	}
 
-	newsession->whitefilters = ao2_container_alloc(1, NULL, NULL);
-	newsession->blackfilters = ao2_container_alloc(1, NULL, NULL);
+	newsession->whitefilters = ao2_container_alloc_list(AO2_ALLOC_OPT_LOCK_MUTEX, 0, NULL, NULL);
+	newsession->blackfilters = ao2_container_alloc_list(AO2_ALLOC_OPT_LOCK_MUTEX, 0, NULL, NULL);
 	if (!newsession->whitefilters || !newsession->blackfilters) {
 		ao2_ref(newsession, -1);
 		return NULL;
@@ -2801,6 +2803,34 @@ static const char *__astman_get_header(const struct message *m, char *var, int m
 const char *astman_get_header(const struct message *m, char *var)
 {
 	return __astman_get_header(m, var, GET_HEADER_FIRST_MATCH);
+}
+
+/*!
+ * \brief Append additional headers into the message structure from params.
+ *
+ * \note You likely want to initialize m->hdrcount to 0 before calling this.
+ */
+static void astman_append_headers(struct message *m, const struct ast_variable *params)
+{
+	const struct ast_variable *v;
+
+	for (v = params; v && m->hdrcount < ARRAY_LEN(m->headers); v = v->next) {
+		if (ast_asprintf((char**)&m->headers[m->hdrcount], "%s: %s", v->name, v->value) > -1) {
+			++m->hdrcount;
+		}
+	}
+}
+
+/*!
+ * \brief Free headers inside message structure, but not the message structure itself.
+ */
+static void astman_free_headers(struct message *m)
+{
+	while (m->hdrcount) {
+		--m->hdrcount;
+		ast_free((void *) m->headers[m->hdrcount]);
+		m->headers[m->hdrcount] = NULL;
+	}
 }
 
 /*!
@@ -4745,10 +4775,13 @@ static int action_status(struct mansession *s, const struct message *m)
 
 static int action_sendtext(struct mansession *s, const struct message *m)
 {
-	struct ast_channel *c = NULL;
+	struct ast_channel *c;
 	const char *name = astman_get_header(m, "Channel");
 	const char *textmsg = astman_get_header(m, "Message");
-	int res = 0;
+	struct ast_control_read_action_payload *frame_payload;
+	int payload_size;
+	int frame_size;
+	int res;
 
 	if (ast_strlen_zero(name)) {
 		astman_send_error(s, m, "No channel specified");
@@ -4760,13 +4793,29 @@ static int action_sendtext(struct mansession *s, const struct message *m)
 		return 0;
 	}
 
-	if (!(c = ast_channel_get_by_name(name))) {
+	c = ast_channel_get_by_name(name);
+	if (!c) {
 		astman_send_error(s, m, "No such channel");
 		return 0;
 	}
 
-	res = ast_sendtext(c, textmsg);
-	c = ast_channel_unref(c);
+	payload_size = strlen(textmsg) + 1;
+	frame_size = payload_size + sizeof(*frame_payload);
+
+	frame_payload = ast_malloc(frame_size);
+	if (!frame_payload) {
+		ast_channel_unref(c);
+		astman_send_error(s, m, "Failure");
+		return 0;
+	}
+
+	frame_payload->action = AST_FRAME_READ_ACTION_SEND_TEXT;
+	frame_payload->payload_size = payload_size;
+	memcpy(frame_payload->payload, textmsg, payload_size);
+	res = ast_queue_control_data(c, AST_CONTROL_READ_ACTION, frame_payload, frame_size);
+
+	ast_free(frame_payload);
+	ast_channel_unref(c);
 
 	if (res >= 0) {
 		astman_send_ack(s, m, "Success");
@@ -6201,7 +6250,7 @@ static int action_coreshowchannels(struct mansession *s, const struct message *m
 	int numchans = 0;
 	struct ao2_container *channels;
 	struct ao2_iterator it_chans;
-	struct stasis_message *msg;
+	struct ast_channel_snapshot *cs;
 
 	if (!ast_strlen_zero(actionid)) {
 		snprintf(idText, sizeof(idText), "ActionID: %s\r\n", actionid);
@@ -6209,17 +6258,12 @@ static int action_coreshowchannels(struct mansession *s, const struct message *m
 		idText[0] = '\0';
 	}
 
-	channels = stasis_cache_dump(ast_channel_cache_by_name(), ast_channel_snapshot_type());
-	if (!channels) {
-		astman_send_error(s, m, "Could not get cached channels");
-		return 0;
-	}
+	channels = ast_channel_cache_by_name();
 
 	astman_send_listack(s, m, "Channels will follow", "start");
 
 	it_chans = ao2_iterator_init(channels, 0);
-	for (; (msg = ao2_iterator_next(&it_chans)); ao2_ref(msg, -1)) {
-		struct ast_channel_snapshot *cs = stasis_message_data(msg);
+	for (; (cs = ao2_iterator_next(&it_chans)); ao2_ref(cs, -1)) {
 		struct ast_str *built = ast_manager_build_channel_state_string_prefix(cs, "");
 		char durbuf[16] = "";
 
@@ -6227,10 +6271,10 @@ static int action_coreshowchannels(struct mansession *s, const struct message *m
 			continue;
 		}
 
-		if (!ast_tvzero(cs->creationtime)) {
+		if (!ast_tvzero(cs->base->creationtime)) {
 			int duration, durh, durm, durs;
 
-			duration = (int)(ast_tvdiff_ms(ast_tvnow(), cs->creationtime) / 1000);
+			duration = (int)(ast_tvdiff_ms(ast_tvnow(), cs->base->creationtime) / 1000);
 			durh = duration / 3600;
 			durm = (duration % 3600) / 60;
 			durs = duration % 60;
@@ -6248,10 +6292,10 @@ static int action_coreshowchannels(struct mansession *s, const struct message *m
 			"\r\n",
 			idText,
 			ast_str_buffer(built),
-			cs->appl,
-			cs->data,
+			cs->dialplan->appl,
+			cs->dialplan->data,
 			durbuf,
-			cs->bridgeid);
+			cs->bridge->id);
 
 		numchans++;
 
@@ -6639,7 +6683,6 @@ static int do_message(struct mansession *s)
 	struct message m = { 0 };
 	char header_buf[sizeof(s->session->inbuf)] = { '\0' };
 	int res;
-	int idx;
 	int hdr_loss;
 	time_t now;
 
@@ -6707,10 +6750,8 @@ static int do_message(struct mansession *s)
 		}
 	}
 
-	/* Free AMI request headers. */
-	for (idx = 0; idx < m.hdrcount; ++idx) {
-		ast_free((void *) m.headers[idx]);
-	}
+	astman_free_headers(&m);
+
 	return res;
 }
 
@@ -7593,7 +7634,8 @@ static void xml_translate(struct ast_str **out, char *in, struct ast_variable *g
 			if (xml) {
 				ast_str_append(out, 0, "<response type='object' id='%s'><%s", dest, objtype);
 			}
-			vco = ao2_container_alloc(37, variable_count_hash_fn, variable_count_cmp_fn);
+			vco = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0, 37,
+				variable_count_hash_fn, NULL, variable_count_cmp_fn);
 			inobj = 1;
 		}
 
@@ -7704,13 +7746,10 @@ static int generic_http_callback(struct ast_tcptls_session_instance *ser,
 	uint32_t ident;
 	int fd;
 	int blastaway = 0;
-	struct ast_variable *v;
 	struct ast_variable *params = get_params;
 	char template[] = "/tmp/ast-http-XXXXXX";	/* template for temporary file */
 	struct ast_str *http_header = NULL, *out = NULL;
 	struct message m = { 0 };
-	unsigned int idx;
-	size_t hdrlen;
 
 	if (method != AST_HTTP_GET && method != AST_HTTP_HEAD && method != AST_HTTP_POST) {
 		ast_http_error(ser, 501, "Not Implemented", "Attempt to use unimplemented / unsupported method");
@@ -7793,17 +7832,7 @@ static int generic_http_callback(struct ast_tcptls_session_instance *ser,
 		}
 	}
 
-	for (v = params; v && m.hdrcount < ARRAY_LEN(m.headers); v = v->next) {
-		hdrlen = strlen(v->name) + strlen(v->value) + 3;
-		m.headers[m.hdrcount] = ast_malloc(hdrlen);
-		if (!m.headers[m.hdrcount]) {
-			/* Allocation failure */
-			continue;
-		}
-		snprintf((char *) m.headers[m.hdrcount], hdrlen, "%s: %s", v->name, v->value);
-		ast_debug(1, "HTTP Manager add header %s\n", m.headers[m.hdrcount]);
-		++m.hdrcount;
-	}
+	astman_append_headers(&m, params);
 
 	if (process_message(&s, &m)) {
 		if (session->authenticated) {
@@ -7818,11 +7847,7 @@ static int generic_http_callback(struct ast_tcptls_session_instance *ser,
 		session->needdestroy = 1;
 	}
 
-	/* Free request headers. */
-	for (idx = 0; idx < m.hdrcount; ++idx) {
-		ast_free((void *) m.headers[idx]);
-		m.headers[idx] = NULL;
-	}
+	astman_free_headers(&m);
 
 	ast_str_append(&http_header, 0,
 		"Content-type: text/%s\r\n"
@@ -7933,8 +7958,6 @@ static int auth_http_callback(struct ast_tcptls_session_instance *ser,
 	struct ast_str *http_header = NULL, *out = NULL;
 	size_t result_size;
 	struct message m = { 0 };
-	unsigned int idx;
-	size_t hdrlen;
 	int fd;
 
 	time_t time_now = time(NULL);
@@ -8157,17 +8180,7 @@ static int auth_http_callback(struct ast_tcptls_session_instance *ser,
 		}
 	}
 
-	for (v = params; v && m.hdrcount < ARRAY_LEN(m.headers); v = v->next) {
-		hdrlen = strlen(v->name) + strlen(v->value) + 3;
-		m.headers[m.hdrcount] = ast_malloc(hdrlen);
-		if (!m.headers[m.hdrcount]) {
-			/* Allocation failure */
-			continue;
-		}
-		snprintf((char *) m.headers[m.hdrcount], hdrlen, "%s: %s", v->name, v->value);
-		ast_verb(4, "HTTP Manager add header %s\n", m.headers[m.hdrcount]);
-		++m.hdrcount;
-	}
+	astman_append_headers(&m, params);
 
 	if (process_message(&s, &m)) {
 		if (u_displayconnects) {
@@ -8177,11 +8190,7 @@ static int auth_http_callback(struct ast_tcptls_session_instance *ser,
 		session->needdestroy = 1;
 	}
 
-	/* Free request headers. */
-	for (idx = 0; idx < m.hdrcount; ++idx) {
-		ast_free((void *) m.headers[idx]);
-		m.headers[idx] = NULL;
-	}
+	astman_free_headers(&m);
 
 	result_size = lseek(ast_iostream_get_fd(s.stream), 0, SEEK_CUR); /* Calculate approx. size of result */
 
@@ -8890,8 +8899,8 @@ static int manager_subscriptions_init(void)
 	stasis_message_router_set_congestion_limits(stasis_router, -1,
 		6 * AST_TASKPROCESSOR_HIGH_WATER_LEVEL);
 
-	res |= stasis_message_router_set_default(stasis_router,
-		manager_default_msg_cb, NULL);
+	stasis_message_router_set_formatters_default(stasis_router,
+		manager_default_msg_cb, NULL, STASIS_SUBSCRIPTION_FORMATTER_AMI);
 
 	res |= stasis_message_router_add(stasis_router,
 		ast_manager_get_generic_type(), manager_generic_msg_cb, NULL);
@@ -8987,7 +8996,7 @@ static int __init_manager(int reload, int by_external_config)
 		if (res != 0) {
 			return -1;
 		}
-		manager_topic = stasis_topic_create("manager_topic");
+		manager_topic = stasis_topic_create("manager:core");
 		if (!manager_topic) {
 			return -1;
 		}
@@ -9054,7 +9063,7 @@ static int __init_manager(int reload, int by_external_config)
 #endif
 
 		/* If you have a NULL hash fn, you only need a single bucket */
-		sessions = ao2_container_alloc(1, NULL, mansession_cmp_fn);
+		sessions = ao2_container_alloc_list(AO2_ALLOC_OPT_LOCK_MUTEX, 0, NULL, mansession_cmp_fn);
 		if (!sessions) {
 			return -1;
 		}
@@ -9310,8 +9319,8 @@ static int __init_manager(int reload, int by_external_config)
 			/* Default allowmultiplelogin from [general] */
 			user->allowmultiplelogin = allowmultiplelogin;
 			user->writetimeout = 100;
-			user->whitefilters = ao2_container_alloc(1, NULL, NULL);
-			user->blackfilters = ao2_container_alloc(1, NULL, NULL);
+			user->whitefilters = ao2_container_alloc_list(AO2_ALLOC_OPT_LOCK_MUTEX, 0, NULL, NULL);
+			user->blackfilters = ao2_container_alloc_list(AO2_ALLOC_OPT_LOCK_MUTEX, 0, NULL, NULL);
 			if (!user->whitefilters || !user->blackfilters) {
 				manager_free_user(user);
 				break;
@@ -9581,5 +9590,5 @@ AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS | AST_MODFLAG_LOAD_
 	.unload = unload_module,
 	.reload = reload_module,
 	.load_pri = AST_MODPRI_CORE,
-	.requires = "http",
+	.requires = "extconfig,acl,http",
 );

@@ -316,6 +316,14 @@ static void statsd_shutdown(void)
 	}
 }
 
+static int unload_module(void)
+{
+	statsd_shutdown();
+	aco_info_destroy(&cfg_info);
+	ao2_global_obj_release(confs);
+	return 0;
+}
+
 static int load_module(void)
 {
 	if (aco_info_init(&cfg_info)) {
@@ -339,43 +347,59 @@ static int load_module(void)
 		"", OPT_CHAR_ARRAY_T, 0,
 		CHARFLDSET(struct conf_global_options, prefix));
 
-	if (aco_process_config(&cfg_info, 0)) {
-		aco_info_destroy(&cfg_info);
-		return AST_MODULE_LOAD_DECLINE;
+	if (aco_process_config(&cfg_info, 0) == ACO_PROCESS_ERROR) {
+		struct conf *cfg;
+
+		ast_log(LOG_NOTICE, "Could not load statsd config; using defaults\n");
+		cfg = conf_alloc();
+		if (!cfg) {
+			aco_info_destroy(&cfg_info);
+			return AST_MODULE_LOAD_DECLINE;
+		}
+
+		if (aco_set_defaults(&global_option, "general", cfg->global)) {
+			ast_log(LOG_ERROR, "Failed to initialize statsd defaults.\n");
+			ao2_ref(cfg, -1);
+			aco_info_destroy(&cfg_info);
+			return AST_MODULE_LOAD_DECLINE;
+		}
+
+		ao2_global_obj_replace_unref(confs, cfg);
+		ao2_ref(cfg, -1);
 	}
 
 	if (!is_enabled()) {
 		return AST_MODULE_LOAD_SUCCESS;
 	}
 
-	if (statsd_init() != 0) {
-		aco_info_destroy(&cfg_info);
+	if (statsd_init()) {
+		unload_module();
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	return AST_MODULE_LOAD_SUCCESS;
 }
 
-static int unload_module(void)
-{
-	statsd_shutdown();
-	aco_info_destroy(&cfg_info);
-	ao2_global_obj_release(confs);
-	return 0;
-}
-
 static int reload_module(void)
 {
-	if (aco_process_config(&cfg_info, 1)) {
+	switch (aco_process_config(&cfg_info, 1)) {
+	case ACO_PROCESS_OK:
+		break;
+	case ACO_PROCESS_UNCHANGED:
+		return AST_MODULE_LOAD_SUCCESS;
+	case ACO_PROCESS_ERROR:
+	default:
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
 	if (is_enabled()) {
-		return statsd_init();
+		if (statsd_init()) {
+			return AST_MODULE_LOAD_DECLINE;
+		}
 	} else {
 		statsd_shutdown();
-		return AST_MODULE_LOAD_SUCCESS;
 	}
+	return AST_MODULE_LOAD_SUCCESS;
 }
 
 /* The priority of this module is set just after realtime, since it loads
