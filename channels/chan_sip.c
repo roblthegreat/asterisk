@@ -11637,7 +11637,7 @@ static int process_sdp_a_text(const char *a, struct sip_pvt *p, struct ast_rtp_c
 				ast_verbose("Discarded description format %s for ID %u\n", mimeSubtype, codec);
 		}
 	} else if (!strncmp(a, red_fmtp, strlen(red_fmtp))) {
-		char *rest;
+		char *rest = NULL;
 		/* count numbers of generations in fmtp */
 		red_cp = &red_fmtp[strlen(red_fmtp)];
 		strncpy(red_fmtp, a, 100);
@@ -33182,7 +33182,8 @@ static int reload_config(enum channelreloadreason reason)
 				ast_log(LOG_WARNING, "Usage of SIP_CAUSE is deprecated.  Please use HANGUPCAUSE instead.\n");
 			}
 		} else if (!strcasecmp(v->name, "qualifygap")) {
-			if (sscanf(v->value, "%30d", &global_qualify_gap) != 1) {
+			if (sscanf(v->value, "%30d", &global_qualify_gap) != 1
+				|| global_qualify_gap < 0) {
 				ast_log(LOG_WARNING, "Invalid qualifygap '%s' at line %d of %s\n", v->value, v->lineno, config);
 				global_qualify_gap = DEFAULT_QUALIFY_GAP;
 			}

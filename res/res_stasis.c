@@ -116,16 +116,23 @@ static struct ast_json *stasis_end_to_json(struct stasis_message *message,
 		const struct stasis_message_sanitizer *sanitize)
 {
 	struct ast_channel_blob *payload = stasis_message_data(message);
+	struct ast_json *msg;
 
 	if (sanitize && sanitize->channel_snapshot &&
 			sanitize->channel_snapshot(payload->snapshot)) {
 		return NULL;
 	}
 
-	return ast_json_pack("{s: s, s: o, s: o}",
+	msg = ast_json_pack("{s: s, s: O, s: o}",
 		"type", "StasisEnd",
-		"timestamp", ast_json_timeval(ast_tvnow(), NULL),
+		"timestamp", ast_json_object_get(payload->blob, "timestamp"),
 		"channel", ast_channel_snapshot_to_json(payload->snapshot, sanitize));
+	if (!msg) {
+		ast_log(LOG_ERROR, "Failed to pack JSON for StasisEnd message\n");
+		return NULL;
+	}
+
+	return msg;
 }
 
 STASIS_MESSAGE_TYPE_DEFN_LOCAL(end_message_type,
@@ -1063,7 +1070,10 @@ int app_send_end_msg(struct stasis_app *app, struct ast_channel *chan)
 		return 0;
 	}
 
-	blob = ast_json_pack("{s: s}", "app", stasis_app_name(app));
+	blob = ast_json_pack("{s: s, s: o}",
+		"app", stasis_app_name(app),
+		"timestamp", ast_json_timeval(ast_tvnow(), NULL)
+		);
 	if (!blob) {
 		ast_log(LOG_ERROR, "Error packing JSON for StasisEnd message\n");
 		return -1;
@@ -1460,30 +1470,35 @@ int stasis_app_exec(struct ast_channel *chan, const char *app_name, int argc,
 					int next_argc = control_next_app_args_size(control);
 					char **next_argv = control_next_app_args(control);
 
-					msg = ast_json_pack("{s: s, s: o, s: s, s: []}",
+					msg = ast_json_pack("{s: s, s: o, s: o, s: s, s: []}",
 						"type", "ApplicationMoveFailed",
+						"timestamp", ast_json_timeval(ast_tvnow(), NULL),
 						"channel", ast_channel_snapshot_to_json(snapshot, NULL),
 						"destination", control_next_app(control),
 						"args");
-					json_args = ast_json_object_get(msg, "args");
-					if (!json_args) {
-						ast_log(LOG_ERROR, "Could not get args json array");
+					if (!msg) {
+						ast_log(LOG_ERROR, "Failed to pack JSON for ApplicationMoveFailed message\n");
 					} else {
-						int r = 0;
-						int idx;
-						for (idx = 0; idx < next_argc; ++idx) {
-							r = ast_json_array_append(json_args,
-								ast_json_string_create(next_argv[idx]));
-							if (r != 0) {
-								ast_log(LOG_ERROR, "Error appending to ApplicationMoveFailed message\n");
-								break;
+						json_args = ast_json_object_get(msg, "args");
+						if (!json_args) {
+							ast_log(LOG_ERROR, "Could not get args json array");
+						} else {
+							int r = 0;
+							int idx;
+							for (idx = 0; idx < next_argc; ++idx) {
+								r = ast_json_array_append(json_args,
+									ast_json_string_create(next_argv[idx]));
+								if (r != 0) {
+									ast_log(LOG_ERROR, "Error appending to ApplicationMoveFailed message\n");
+									break;
+								}
+							}
+							if (r == 0) {
+								app_send(control_app(control), msg);
 							}
 						}
-						if (r == 0) {
-							app_send(control_app(control), msg);
-						}
+						ast_json_unref(msg);
 					}
-					ast_json_unref(msg);
 				}
 			}
 			control_move_cleanup(control);
